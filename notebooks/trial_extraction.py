@@ -266,6 +266,11 @@ def merge_trial_df_with_target(target_dataframe, trials_dataframe, reward_ranges
     merged_dataframe["trial_progress"] = merged_dataframe["time_since_trial_start"]/merged_dataframe["trial_duration (s)"]
     merged_dataframe = merged_dataframe.drop("time_since_trial_start", axis = 1)
     
+    merged_dataframe["distance_increment"] = merged_dataframe.groupby("trial_number")["linear_position"].diff().fillna(0).abs()
+    merged_dataframe["distance_since_trial_start"] = merged_dataframe.groupby("trial_number")["distance_increment"].cumsum()
+    merged_dataframe["trial_progress_distance"] = merged_dataframe["distance_since_trial_start"] / merged_dataframe.groupby("trial_number")["distance_since_trial_start"].transform("max").replace(0, np.nan)
+    merged_dataframe = merged_dataframe.drop(["distance_increment", "distance_since_trial_start"], axis = 1)
+    
 
     in_reward_range = False
     for start_pos, end_pos in reward_ranges:

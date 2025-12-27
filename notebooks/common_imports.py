@@ -15,6 +15,9 @@ raw_dir = base_dir + "raw/"
 
 os.environ["SPYGLASS_BASE_DIR"] = base_dir
 os.environ["SPYGLASS_RAW_DIR"] = raw_dir
+os.environ["KACHERY_CLOUD_DIR"] = "/home/labuser/.kachery-cloud"
+os.environ["KACHERY_ZONE"] = "default"
+
 
 import spyglass.common as sgc
 
@@ -22,3 +25,4 @@ from spyglass.utils.nwb_helper_fn import get_nwb_copy_filename
 nwb_file_name = "wilbur20210512.nwb"
 nwb_copy_file_name = get_nwb_copy_filename(nwb_file_name)
 session_restrict = {"nwb_file_name": nwb_copy_file_name}
+prefix = "wilbur20210512"
