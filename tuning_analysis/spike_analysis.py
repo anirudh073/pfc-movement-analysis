@@ -3312,7 +3312,6 @@ def compare_speed_tuning_across_progress_segments(
                     corr=curve_corr(ci, cj),
                     nrmse=nrmse(ci, cj),
                     peak_shift_bins=peak_bin_shift(ci, cj),
-                    mean_rate_diff=mean_rate_diff(ci, cj),
                 )
 
             pairwise_metrics[(li, lj)] = metrics_per_unit
@@ -3350,7 +3349,11 @@ class CurveMetricSpec:
     to_diff_stat: Callable[[float], float]
 
 
-def default_curve_metric_specs(*, use_peak_shift_x: bool = True) -> Tuple[CurveMetricSpec, ...]:
+def default_curve_metric_specs(
+    *,
+    use_peak_shift_x: bool = True,
+    include_mean_rate_diff: bool = False,
+) -> Tuple[CurveMetricSpec, ...]:
     """
     Default metric set used in unit_tuning.ipynb-style comparisons.
 
@@ -3358,16 +3361,18 @@ def default_curve_metric_specs(*, use_peak_shift_x: bool = True) -> Tuple[CurveM
       - corr: lower corr => more different => stat = 1 - corr
       - nrmse: higher => more different => stat = nrmse
       - peak shift: higher => more different => stat = peak_shift_x or peak_bin_shift
-      - mean_rate_diff: higher => more different => stat = mean_rate_diff
+      - mean_rate_diff (optional): higher => more different => stat = mean_rate_diff
     """
     peak_func = peak_shift_x if use_peak_shift_x else peak_bin_shift
     peak_name = "peak_shift_x" if use_peak_shift_x else "peak_shift_bins"
-    return (
+    specs = [
         CurveMetricSpec("corr", curve_corr, to_diff_stat=lambda r: (1.0 - r) if np.isfinite(r) else float("nan")),
         CurveMetricSpec("nrmse", lambda a, b, x, m: nrmse(a, b, x, m), to_diff_stat=lambda e: e),
         CurveMetricSpec(peak_name, peak_func, to_diff_stat=lambda p: p),
-        CurveMetricSpec("mean_rate_diff", mean_rate_diff, to_diff_stat=lambda d: d),
-    )
+    ]
+    if include_mean_rate_diff:
+        specs.append(CurveMetricSpec("mean_rate_diff", mean_rate_diff, to_diff_stat=lambda d: d))
+    return tuple(specs)
 
 
 def fdr_bh(p_values: Union[np.ndarray, Sequence[float]], *, alpha: float = 0.05) -> Tuple[np.ndarray, np.ndarray]:
@@ -3718,6 +3723,67 @@ def _compute_metrics_and_stats(
     return metrics, stats, [s.name for s in metric_specs]
 
 
+def _standardize_stats_by_null(
+    *,
+    stats_obs: np.ndarray,
+    null_stats: np.ndarray,
+    method: str,
+    eps: float = 1e-12,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Standardize per-unit/per-metric stats using the permutation null distribution so that
+    different metrics live on a comparable numerical scale before being combined.
+
+    Parameters
+    ----------
+    stats_obs:
+        (n_units, n_metrics) observed stats (larger = more different).
+    null_stats:
+        (n_units, n_metrics, n_perm) null stats from permutations.
+    method:
+        - "zscore": (x - mean_null) / std_null
+        - "robust_z": (x - median_null) / (IQR/1.349)
+        - "none": return inputs unchanged (still returns loc/scale).
+
+    Returns
+    -------
+    stats_obs_std:
+        (n_units, n_metrics) standardized observed stats.
+    null_stats_std:
+        (n_units, n_metrics, n_perm) standardized null stats.
+    loc:
+        (n_units, n_metrics) null location used.
+    scale:
+        (n_units, n_metrics) null scale used.
+    """
+    stats_obs = np.asarray(stats_obs, dtype=float)
+    null_stats = np.asarray(null_stats, dtype=float)
+    method = str(method).lower()
+    if method not in {"none", "zscore", "robust_z"}:
+        raise ValueError(f"Unknown standardization method: {method!r}")
+
+    if method == "none":
+        loc = np.nanmean(null_stats, axis=2)
+        scale = np.nanstd(null_stats, axis=2, ddof=1)
+        scale = np.where(np.isfinite(scale) & (scale > float(eps)), scale, np.nan)
+        return stats_obs, null_stats, loc, scale
+
+    if method == "zscore":
+        loc = np.nanmean(null_stats, axis=2)
+        scale = np.nanstd(null_stats, axis=2, ddof=1)
+    else:
+        loc = np.nanmedian(null_stats, axis=2)
+        q75 = np.nanpercentile(null_stats, 75, axis=2)
+        q25 = np.nanpercentile(null_stats, 25, axis=2)
+        iqr = q75 - q25
+        scale = iqr / 1.349
+
+    scale = np.where(np.isfinite(scale) & (scale > float(eps)), scale, np.nan)
+    stats_obs_std = (stats_obs - loc) / scale
+    null_stats_std = (null_stats - loc[:, :, None]) / scale[:, :, None]
+    return stats_obs_std, null_stats_std, loc, scale
+
+
 def permutation_test_tuning_difference_trial_labels(
     position_df: pd.DataFrame,
     *,
@@ -3741,6 +3807,7 @@ def permutation_test_tuning_difference_trial_labels(
     min_bins: int = 3,
     min_occupancy_s: float = 0.25,
     peak_normalize: bool = True,
+    max_stat_standardization: str = "zscore",
     n_perm: int = 2000,
     random_state: int = 0,
     strata_column: Optional[str] = None,
@@ -3753,9 +3820,18 @@ def permutation_test_tuning_difference_trial_labels(
     Null distribution is built by shuffling which trials are assigned to A vs B
     (optionally within strata like epoch).
 
+    max_stat_standardization
+    -----------------------
+    Controls how the omnibus max-statistic (p_max/q_max) is computed across metrics:
+      - "none": max over raw per-metric stats (can be dominated by large-scale metrics)
+      - "zscore" (default): per-unit/per-metric z-score using permutation null mean/std,
+        then max over z-scores
+      - "robust_z": robust z-score using null median and IQR/1.349
+
     Returns dict with DataFrames:
       - observed_metrics: per-unit metric values (corr, nrmse, peak shift, ...)
       - observed_stats: the transformed "difference stats" used for p-values
+      - observed_stats_standardized (if max_stat_standardization != "none"): z-scored stats
       - p_values: p-value per metric
       - p_max: omnibus p for max(stat across metrics) per unit
       - q_values, q_max: BH-FDR across units
@@ -3845,14 +3921,28 @@ def permutation_test_tuning_difference_trial_labels(
     ge_counts_max = np.zeros(n_units, dtype=np.int64)
     denom_counts_max = np.zeros(n_units, dtype=np.int64)
 
-    obs_max = np.nanmax(stats_obs, axis=1)
-
     rng = np.random.default_rng(int(random_state))
     base_group = is_a.astype(bool).copy()
 
+    max_stat_standardization = str(max_stat_standardization).lower()
+    if max_stat_standardization not in {"none", "zscore", "robust_z"}:
+        raise ValueError(
+            "max_stat_standardization must be one of {'none','zscore','robust_z'}; "
+            f"got {max_stat_standardization!r}"
+        )
+
+    # If we standardize the max-stat across metrics, we need the per-metric null stats
+    # to compute a per-metric scale before taking max(). If not standardizing, we can
+    # compute p_max on-the-fly without storing null stats unless return_null=True.
+    need_null_stats = bool(return_null) or (max_stat_standardization != "none")
+
+    obs_max = None
+    if max_stat_standardization == "none":
+        obs_max = np.nanmax(stats_obs, axis=1)
+
     null_stats = None
     null_max = None
-    if return_null:
+    if need_null_stats:
         null_stats = np.full((n_units, n_metrics, int(n_perm)), np.nan, dtype=float)
         null_max = np.full((n_units, int(n_perm)), np.nan, dtype=float)
 
@@ -3867,7 +3957,7 @@ def permutation_test_tuning_difference_trial_labels(
                 rates_a=ra, rates_b=rb, centers=np.asarray(pre["centers"]), metric_specs=metric_specs, min_bins=min_bins
             )
 
-            if return_null:
+            if need_null_stats:
                 null_stats[:, :, r] = s
                 null_max[:, r] = np.nanmax(s, axis=1)
 
@@ -3875,10 +3965,11 @@ def permutation_test_tuning_difference_trial_labels(
             denom_counts += finite.astype(np.int64)
             ge_counts += (finite & (s >= stats_obs)).astype(np.int64)
 
-            smax = np.nanmax(s, axis=1)
-            finite_m = np.isfinite(smax) & np.isfinite(obs_max)
-            denom_counts_max += finite_m.astype(np.int64)
-            ge_counts_max += (finite_m & (smax >= obs_max)).astype(np.int64)
+            if max_stat_standardization == "none":
+                smax = np.nanmax(s, axis=1)
+                finite_m = np.isfinite(smax) & np.isfinite(obs_max)
+                denom_counts_max += finite_m.astype(np.int64)
+                ge_counts_max += (finite_m & (smax >= obs_max)).astype(np.int64)
     else:
         strata = np.asarray(strata_per_trial)
         uniq = pd.unique(strata)
@@ -3895,7 +3986,7 @@ def permutation_test_tuning_difference_trial_labels(
                 rates_a=ra, rates_b=rb, centers=np.asarray(pre["centers"]), metric_specs=metric_specs, min_bins=min_bins
             )
 
-            if return_null:
+            if need_null_stats:
                 null_stats[:, :, r] = s
                 null_max[:, r] = np.nanmax(s, axis=1)
 
@@ -3903,13 +3994,40 @@ def permutation_test_tuning_difference_trial_labels(
             denom_counts += finite.astype(np.int64)
             ge_counts += (finite & (s >= stats_obs)).astype(np.int64)
 
-            smax = np.nanmax(s, axis=1)
-            finite_m = np.isfinite(smax) & np.isfinite(obs_max)
-            denom_counts_max += finite_m.astype(np.int64)
-            ge_counts_max += (finite_m & (smax >= obs_max)).astype(np.int64)
+            if max_stat_standardization == "none":
+                smax = np.nanmax(s, axis=1)
+                finite_m = np.isfinite(smax) & np.isfinite(obs_max)
+                denom_counts_max += finite_m.astype(np.int64)
+                ge_counts_max += (finite_m & (smax >= obs_max)).astype(np.int64)
 
     p = (ge_counts + 1.0) / (denom_counts + 1.0)
-    p_max = (ge_counts_max + 1.0) / (denom_counts_max + 1.0)
+    stats_obs_std = None
+    null_stats_std = None
+    max_loc = None
+    max_scale = None
+    out_null_max_raw = None
+
+    if max_stat_standardization == "none":
+        p_max = (ge_counts_max + 1.0) / (denom_counts_max + 1.0)
+    else:
+        if null_stats is None:
+            raise RuntimeError("Internal error: null_stats missing for standardized max-stat computation.")
+        stats_obs_std, null_stats_std, max_loc, max_scale = _standardize_stats_by_null(
+            stats_obs=stats_obs, null_stats=null_stats, method=max_stat_standardization
+        )
+        obs_max_std = np.nanmax(stats_obs_std, axis=1)  # (n_units,)
+        null_max_std = np.nanmax(null_stats_std, axis=1)  # (n_units, n_perm)
+
+        finite_m = np.isfinite(null_max_std) & np.isfinite(obs_max_std)[:, None]
+        denom_counts_max = np.sum(finite_m, axis=1).astype(np.int64)
+        ge_counts_max = np.sum(finite_m & (null_max_std >= obs_max_std[:, None]), axis=1).astype(np.int64)
+        p_max = (ge_counts_max + 1.0) / (denom_counts_max + 1.0)
+
+        # Preserve the raw null max if requested, but return the standardized max as `null_max`
+        # since that's what is used for p_max in this mode.
+        if return_null:
+            out_null_max_raw = null_max
+            null_max = null_max_std
 
     obs_df = pd.DataFrame(metrics_obs, index=unit_ids, columns=metric_names)
     obs_stat_df = pd.DataFrame(stats_obs, index=unit_ids, columns=[f"{n}_stat" for n in metric_names])
@@ -3940,10 +4058,19 @@ def permutation_test_tuning_difference_trial_labels(
         valid_bins_mask_observed=(np.asarray(occ_a_obs) > float(min_occupancy_s))
         & (np.asarray(occ_b_obs) > float(min_occupancy_s))
         & np.isfinite(np.asarray(pre["centers"])),
+        max_stat_standardization=max_stat_standardization,
     )
     if return_null:
         out["null_stats"] = null_stats
         out["null_max"] = null_max
+        if out_null_max_raw is not None:
+            out["null_max_raw"] = out_null_max_raw
+    if (max_stat_standardization != "none") and (stats_obs_std is not None):
+        out["observed_stats_standardized"] = pd.DataFrame(
+            stats_obs_std, index=unit_ids, columns=[f"{n}_z" for n in metric_names]
+        )
+        out["max_stat_loc"] = pd.DataFrame(max_loc, index=unit_ids, columns=[f"{n}_loc" for n in metric_names])
+        out["max_stat_scale"] = pd.DataFrame(max_scale, index=unit_ids, columns=[f"{n}_scale" for n in metric_names])
     return out
 
 
@@ -3972,6 +4099,7 @@ def paired_permutation_test_tuning_difference_masks(
     min_occupancy_s: float = 0.25,
     min_trial_occupancy_s: float = 0.0,
     peak_normalize: bool = True,
+    max_stat_standardization: str = "zscore",
     n_perm: int = 2000,
     random_state: int = 0,
     units: Optional[Sequence[int]] = None,
@@ -3982,6 +4110,14 @@ def paired_permutation_test_tuning_difference_masks(
 
     You supply two sample-level masks (len(position_df)) defining A vs B.
     The null is built by swapping A/B within each trial with p=0.5.
+
+    max_stat_standardization
+    -----------------------
+    Controls how the omnibus max-statistic (p_max/q_max) is computed across metrics:
+      - "none": max over raw per-metric stats
+      - "zscore" (default): per-unit/per-metric z-score using permutation null mean/std,
+        then max over z-scores
+      - "robust_z": robust z-score using null median and IQR/1.349
     """
     if metric_specs is None:
         metric_specs = default_curve_metric_specs(use_peak_shift_x=True)
@@ -4089,14 +4225,25 @@ def paired_permutation_test_tuning_difference_masks(
     ge_counts_max = np.zeros(n_units, dtype=np.int64)
     denom_counts_max = np.zeros(n_units, dtype=np.int64)
 
-    obs_max = np.nanmax(stats_obs, axis=1)
-
     rng = np.random.default_rng(int(random_state))
     n_trials = int(trials_common.size)
 
+    max_stat_standardization = str(max_stat_standardization).lower()
+    if max_stat_standardization not in {"none", "zscore", "robust_z"}:
+        raise ValueError(
+            "max_stat_standardization must be one of {'none','zscore','robust_z'}; "
+            f"got {max_stat_standardization!r}"
+        )
+
+    need_null_stats = bool(return_null) or (max_stat_standardization != "none")
+
+    obs_max = None
+    if max_stat_standardization == "none":
+        obs_max = np.nanmax(stats_obs, axis=1)
+
     null_stats = None
     null_max = None
-    if return_null:
+    if need_null_stats:
         null_stats = np.full((n_units, n_metrics, int(n_perm)), np.nan, dtype=float)
         null_max = np.full((n_units, int(n_perm)), np.nan, dtype=float)
 
@@ -4127,7 +4274,7 @@ def paired_permutation_test_tuning_difference_masks(
             rates_a=ra, rates_b=rb, centers=np.asarray(pre_a["centers"]), metric_specs=metric_specs, min_bins=min_bins
         )
 
-        if return_null:
+        if need_null_stats:
             null_stats[:, :, r] = s
             null_max[:, r] = np.nanmax(s, axis=1)
 
@@ -4135,13 +4282,39 @@ def paired_permutation_test_tuning_difference_masks(
         denom_counts += finite.astype(np.int64)
         ge_counts += (finite & (s >= stats_obs)).astype(np.int64)
 
-        smax = np.nanmax(s, axis=1)
-        finite_m = np.isfinite(smax) & np.isfinite(obs_max)
-        denom_counts_max += finite_m.astype(np.int64)
-        ge_counts_max += (finite_m & (smax >= obs_max)).astype(np.int64)
+        if max_stat_standardization == "none":
+            smax = np.nanmax(s, axis=1)
+            finite_m = np.isfinite(smax) & np.isfinite(obs_max)
+            denom_counts_max += finite_m.astype(np.int64)
+            ge_counts_max += (finite_m & (smax >= obs_max)).astype(np.int64)
 
     p = (ge_counts + 1.0) / (denom_counts + 1.0)
-    p_max = (ge_counts_max + 1.0) / (denom_counts_max + 1.0)
+
+    stats_obs_std = None
+    null_stats_std = None
+    max_loc = None
+    max_scale = None
+    out_null_max_raw = None
+
+    if max_stat_standardization == "none":
+        p_max = (ge_counts_max + 1.0) / (denom_counts_max + 1.0)
+    else:
+        if null_stats is None:
+            raise RuntimeError("Internal error: null_stats missing for standardized max-stat computation.")
+        stats_obs_std, null_stats_std, max_loc, max_scale = _standardize_stats_by_null(
+            stats_obs=stats_obs, null_stats=null_stats, method=max_stat_standardization
+        )
+        obs_max_std = np.nanmax(stats_obs_std, axis=1)  # (n_units,)
+        null_max_std = np.nanmax(null_stats_std, axis=1)  # (n_units, n_perm)
+
+        finite_m = np.isfinite(null_max_std) & np.isfinite(obs_max_std)[:, None]
+        denom_counts_max = np.sum(finite_m, axis=1).astype(np.int64)
+        ge_counts_max = np.sum(finite_m & (null_max_std >= obs_max_std[:, None]), axis=1).astype(np.int64)
+        p_max = (ge_counts_max + 1.0) / (denom_counts_max + 1.0)
+
+        if return_null:
+            out_null_max_raw = null_max
+            null_max = null_max_std
 
     obs_df = pd.DataFrame(metrics_obs, index=unit_ids, columns=metric_names)
     obs_stat_df = pd.DataFrame(stats_obs, index=unit_ids, columns=[f"{n}_stat" for n in metric_names])
@@ -4173,10 +4346,19 @@ def paired_permutation_test_tuning_difference_masks(
         valid_bins_mask_observed=(np.asarray(occ_a_obs) > float(min_occupancy_s))
         & (np.asarray(occ_b_obs) > float(min_occupancy_s))
         & np.isfinite(np.asarray(pre_a["centers"])),
+        max_stat_standardization=max_stat_standardization,
     )
     if return_null:
         out["null_stats"] = null_stats
         out["null_max"] = null_max
+        if out_null_max_raw is not None:
+            out["null_max_raw"] = out_null_max_raw
+    if (max_stat_standardization != "none") and (stats_obs_std is not None):
+        out["observed_stats_standardized"] = pd.DataFrame(
+            stats_obs_std, index=unit_ids, columns=[f"{n}_z" for n in metric_names]
+        )
+        out["max_stat_loc"] = pd.DataFrame(max_loc, index=unit_ids, columns=[f"{n}_loc" for n in metric_names])
+        out["max_stat_scale"] = pd.DataFrame(max_scale, index=unit_ids, columns=[f"{n}_scale" for n in metric_names])
     return out
 
 
