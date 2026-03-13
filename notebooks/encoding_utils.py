@@ -18,6 +18,10 @@ from scipy.stats import chi2
 import matplotlib.pyplot as plt
 import seaborn as sns
 import spyglass.linearization.v1 as sgpl
+from statsmodels.stats.multitest import multipletests
+from scipy.stats import wilcoxon
+import itertools
+
 
 
 # ── 1. Data preparation ───────────────────────────────────────────────────────
@@ -228,6 +232,147 @@ def compute_drop_one_lrt(model_name, base_dir, drop_one_specs):
     return pd.DataFrame(rows)
 
 
+def apply_fdr_correction(drop_one_results,
+                         alpha = 0.05):
+    df = drop_one_results.copy()
+    df["significant_fdr"] = False
+    
+    for (model, term), group in df.groupby(["model", "dropped_term"]):
+        valid = group["lrt_pval"].notna()
+        pvals = group.loc[valid, "lrt_pval"].values
+        
+        if len(pvals) == 0:
+            continue
+        
+        reject = multipletests(pvals, method = 'fdr_bh', alpha = alpha)[0]
+        
+        df.loc[valid, "significant_fdr"] = reject
+        
+    return df
+    
+
+def pairwise_term_comparison(drop_one_results: pd.DataFrame,
+                             model_name: str,
+                             term_labels = None,
+                             alpha = 0.05):
+    df = drop_one_results[drop_one_results["model"]==model_name]
+    df_wide = df.pivot(index = "unit", columns = "dropped_term", values = "delta_aic")
+    
+    a_list = []
+    b_list = []
+    pvals_list = []
+    for A, B in itertools.combinations(df_wide.columns, 2):
+        columnA = df_wide[A]
+        columnB = df_wide[B]
+        valid = pd.concat([columnA, columnB], axis =1, join = "inner").dropna().index
+        stat, pvals = wilcoxon(columnA.loc[valid], columnB.loc[valid], zero_method = "wilcoxon", alternative = "two_sided", method = "auto")
+        a_list.append(A)
+        b_list.append(B)
+        pvals_list.append(pvals)
+    
+    pvals_dict = {"term 1": a_list, "term 2": b_list, "pval": pvals_list}
+    pvals_df = pd.DataFrame(pvals_dict)
+    
+    reject, corrected_pvals, _, _ = multipletests(pvals_dict["pval"], method = "fdr_bh", alpha = alpha)
+    
+    pvals_df["pval"] = corrected_pvals
+    terms = list(df_wide.columns)
+    result = pd.DataFrame(np.nan, index = terms, columns = terms)
+    for _, row in pvals_df.iterrows():
+        result.loc[row["term 1"], row["term 2"]] = row["pval"]
+        result.loc[row["term 2"], row["term 1"]] = row["pval"]
+        
+    return result
+
+
+TERM_LABELS = {
+    "trial_type": "trial_type",
+    "choice":     "choice",
+    "bs(pos_scaled, df = 8)":                             "position",
+    "bs(speed_scaled, df = 4)":                           "speed",
+    "cr(trial_progress, df = 6, constraints = 'center')": "trial_progress",
+}
+
+
+def plot_drop_one_summary(drop_one_results, pairwise_pvals=None,
+                          heatmap_model="full_model_all", term_labels=None):
+    """3-panel drop-one summary.
+
+    Panel A : % units significant — raw p<0.05 vs FDR q<0.05
+    Panel B : delta-AIC violin per term (effect size distribution)
+    Panel C : pairwise q-value heatmap with significance annotations
+
+    Requires drop_one_results to have 'significant_fdr' (run apply_fdr_correction first).
+    pairwise_pvals : output of pairwise_term_comparison() — optional, skips Panel C if None.
+    """
+    if term_labels is None:
+        term_labels = TERM_LABELS
+
+    df = drop_one_results.copy()
+    df["term_label"] = df["dropped_term"].map(term_labels).fillna(df["dropped_term"])
+
+    has_fdr = "significant_fdr" in df.columns
+    agg = (df.groupby("term_label")
+             .agg(raw=("significant", "mean"),
+                  **({'fdr': ("significant_fdr", "mean")} if has_fdr else {}))
+             .sort_values("raw", ascending=False))
+
+    term_order = (df.groupby("term_label")["delta_aic"]
+                    .median().sort_values().index.tolist())
+
+    ncols = 3 if pairwise_pvals is not None else 2
+    fig, axes = plt.subplots(1, ncols, figsize=(6 * ncols, 5))
+
+    # A ── % significant
+    ax = axes[0]
+    x, w = np.arange(len(agg)), 0.35
+    ax.bar(x - w/2, agg["raw"] * 100, w, color="steelblue", alpha=0.85, label="raw p<0.05")
+    if has_fdr:
+        ax.bar(x + w/2, agg["fdr"] * 100, w, color="tomato", alpha=0.85, label="FDR q<0.05")
+    ax.axhline(5, color="grey", lw=1, ls="--", label="5%")
+    ax.set_xticks(x); ax.set_xticklabels(agg.index, rotation=25, ha="right")
+    ax.set_ylabel("% units significant")
+    ax.set_title("Unique contribution — significance")
+    ax.legend(fontsize=8); sns.despine(ax=ax)
+
+    # B ── effect size violin
+    ax = axes[1]
+    sns.violinplot(data=df, x="delta_aic", y="term_label", order=term_order,
+                   inner="box", cut=0, color="steelblue", ax=ax)
+    ax.axvline(0, color="red", lw=1, ls="--")
+    ax.set_xlabel("ΔAIC (full − reduced)\nnegative = full model better")
+    ax.set_ylabel(""); ax.set_title("Effect size distribution")
+    sns.despine(ax=ax)
+
+    # C ── pairwise heatmap
+    if pairwise_pvals is not None:
+        ax = axes[2]
+        pw  = pairwise_pvals.rename(index=term_labels, columns=term_labels)
+        mat = pw.values.astype(float)
+        im  = ax.imshow(mat, cmap="RdYlGn_r", vmin=0, vmax=0.1,
+                        aspect="auto", interpolation="nearest")
+        plt.colorbar(im, ax=ax, label="FDR q-value", shrink=0.8)
+        ax.set_xticks(range(len(pw.columns))); ax.set_xticklabels(pw.columns, rotation=30, ha="right")
+        ax.set_yticks(range(len(pw.index)));   ax.set_yticklabels(pw.index)
+        ax.set_title("Pairwise term comparison (Wilcoxon, FDR)")
+
+        for i, row_vals in enumerate(mat):
+            for j, val in enumerate(row_vals):
+                if np.isnan(val):
+                    continue
+                symbol = "***" if val < 0.001 else "**" if val < 0.01 else "*" if val < 0.05 else ""
+                ax.text(j, i, symbol, ha="center", va="center", fontsize=11)
+
+        sns.despine(ax=ax)
+
+    plt.suptitle("Drop-one analysis summary", fontsize=13)
+    plt.tight_layout()
+
+
+
+
+
+
 # ── 4. Visualization ──────────────────────────────────────────────────────────
 # Shared state for plot functions — set via set_plot_state() after fitting
 
@@ -349,6 +494,96 @@ def plot_categorical_comparison(results, cat_col, cov_df, bin_size=0.002, ax=Non
 
     if standalone:
         plt.tight_layout()
+
+
+def plot_partial_dependence_grid(results_combined, var_specs, cov_df,
+                                 bin_size=0.002, n_bins=50, title=""):
+    """N_vars × 2 grid: left = single-variable (uncontrolled), right = partial dependence (controlled).
+
+    Each dict in var_specs:
+        sweep_col      : column swept in prediction DataFrame (e.g. "pos_scaled")
+        actual_col     : column in cov_df for occupancy-normalized empirical rate
+        xlabel         : x-axis label
+        results_single : fitted single-variable GLM
+        fixed          : {col: val} — other covariates held constant
+        min_val, max_val : float or None — rescale sweep from [0,1] to natural units
+        categorical    : bool (default False)
+    """
+    n = len(var_specs)
+    fig, axes = plt.subplots(n, 2, figsize=(12, 4 * n))
+    axes = np.array(axes).reshape(n, 2)
+    if title:
+        fig.suptitle(title, fontsize=12, y=1.01)
+
+    for row, spec in enumerate(var_specs):
+        ax_unc, ax_ctl = axes[row]
+        sweep_col   = spec["sweep_col"]
+        actual_col  = spec["actual_col"]
+        xlabel      = spec["xlabel"]
+        r_single    = spec["results_single"]
+        fixed       = spec["fixed"]
+        min_val     = spec.get("min_val")
+        max_val     = spec.get("max_val")
+        categorical = spec.get("categorical", False)
+
+        if categorical:
+            cats = sorted(cov_df[actual_col].dropna().unique())
+            x = np.arange(len(cats))
+            width = 0.35
+
+            grouped = cov_df.groupby(actual_col)
+            emp_hz = (grouped["spike_count"].sum() / (grouped.size() * bin_size)).reindex(cats).values
+
+            pred_single_hz  = r_single.predict(pd.DataFrame({sweep_col: cats})).values / bin_size
+            syn_comb = pd.DataFrame({sweep_col: cats,
+                                     **{k: [v] * len(cats) for k, v in fixed.items()}})
+            pred_comb_hz = results_combined.predict(syn_comb).values / bin_size
+
+            for ax, pred_hz, clr, lbl in [
+                (ax_unc, pred_single_hz, "steelblue", "Single model"),
+                (ax_ctl, pred_comb_hz,   "tomato",    "Combined (controlled)"),
+            ]:
+                ax.bar(x - width / 2, emp_hz,   width, color="grey",  alpha=0.8, label="Empirical")
+                ax.bar(x + width / 2, pred_hz,  width, color=clr,     alpha=0.8, label=lbl)
+                ax.set_xticks(x)
+                ax.set_xticklabels(cats)
+                ax.set_xlabel(xlabel)
+                ax.set_ylabel("Firing rate (Hz)")
+                ax.legend(fontsize=8)
+                sns.despine(ax=ax)
+        else:
+            valid = cov_df[actual_col].notna()
+            actual_vals = cov_df.loc[valid, actual_col].values
+            spike_vals  = cov_df.loc[valid, "spike_count"].values
+            occ,  bins = np.histogram(actual_vals, bins=n_bins)
+            spks, _    = np.histogram(actual_vals, bins=bins, weights=spike_vals)
+            with np.errstate(invalid="ignore", divide="ignore"):
+                emp_rate = np.where(occ > 0, spks / (occ * bin_size), np.nan)
+            bin_centers = (bins[:-1] + bins[1:]) / 2
+
+            sweep = np.linspace(0, 1, 200)
+            x_natural = sweep * (max_val - min_val) + min_val if min_val is not None else sweep
+
+            pred_single_hz = r_single.predict(pd.DataFrame({sweep_col: sweep})).values / bin_size
+            syn_comb = pd.DataFrame({sweep_col: sweep,
+                                     **{k: [v] * 200 for k, v in fixed.items()}})
+            pred_comb_hz = results_combined.predict(syn_comb).values / bin_size
+
+            for ax, pred_hz, clr, lbl in [
+                (ax_unc, pred_single_hz, "steelblue", "Single model"),
+                (ax_ctl, pred_comb_hz,   "tomato",    "Combined (controlled)"),
+            ]:
+                ax.plot(bin_centers, emp_rate, color="grey", alpha=0.7, lw=1.2, label="Empirical")
+                ax.plot(x_natural, pred_hz, color=clr, lw=2, label=lbl)
+                ax.set_xlabel(xlabel)
+                ax.set_ylabel("Firing rate (Hz)")
+                ax.legend(fontsize=8)
+                sns.despine(ax=ax)
+
+        ax_unc.set_title(f"{xlabel} — uncontrolled")
+        ax_ctl.set_title(f"{xlabel} — partial dependence (controlled)")
+
+    plt.tight_layout()
 
 
 def plot_wtrack_comparison(uid, cov_df, n_bins=50, results=None, pos_run=None):
