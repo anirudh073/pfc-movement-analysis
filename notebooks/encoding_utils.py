@@ -286,6 +286,135 @@ def plot_place_field(uid, ax_curve=None, ax_track=None, graph=None):
         plt.tight_layout()
 
 
+def plot_tuning_comparison(results, syn_df, scaled_col, actual_col, cov_df,
+                           min_val=None, max_val=None, xlabel="Variable",
+                           bin_size=0.002, n_bins=50, ax=None):
+    """Overlay GLM predicted vs empirical occupancy-normalized tuning curve."""
+    standalone = ax is None
+    if standalone:
+        fig, ax = plt.subplots(figsize=(7, 4))
+
+    # Predicted curve
+    pred_hz = results.predict(syn_df) / bin_size
+    if min_val is not None and max_val is not None:
+        x_pred = syn_df[scaled_col].values * (max_val - min_val) + min_val
+    else:
+        x_pred = syn_df[scaled_col].values
+
+    # Empirical occupancy-normalized rate
+    valid = cov_df[actual_col].notna()
+    actual_vals = cov_df.loc[valid, actual_col].values
+    spike_vals  = cov_df.loc[valid, "spike_count"].values
+
+    occ,  bins = np.histogram(actual_vals, bins=n_bins)
+    spks, _    = np.histogram(actual_vals, bins=bins, weights=spike_vals)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        empirical_rate = np.where(occ > 0, spks / (occ * bin_size), np.nan)
+    bin_centers = (bins[:-1] + bins[1:]) / 2
+
+    ax.plot(bin_centers, empirical_rate, color="grey", alpha=0.7, lw=1.2, label="Empirical")
+    ax.plot(x_pred, pred_hz, color="steelblue", lw=2, label="GLM predicted")
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel("Firing rate (Hz)")
+    ax.legend(fontsize=8)
+    sns.despine(ax=ax)
+
+    if standalone:
+        plt.tight_layout()
+
+
+def plot_categorical_comparison(results, cat_col, cov_df, bin_size=0.002, ax=None):
+    """Grouped bar chart: GLM predicted vs empirical rate per category."""
+    standalone = ax is None
+    if standalone:
+        fig, ax = plt.subplots(figsize=(5, 4))
+
+    cats = sorted(cov_df[cat_col].dropna().unique())
+    syn_df = pd.DataFrame({cat_col: cats})
+    pred_hz = results.predict(syn_df).values / bin_size
+
+    grouped = cov_df.groupby(cat_col)
+    emp_hz = (grouped["spike_count"].sum() / (grouped.size() * bin_size)).reindex(cats).values
+
+    x = np.arange(len(cats))
+    width = 0.35
+    ax.bar(x - width / 2, emp_hz,  width, label="Empirical",     color="grey",      alpha=0.8)
+    ax.bar(x + width / 2, pred_hz, width, label="GLM predicted", color="steelblue", alpha=0.8)
+    ax.set_xticks(x)
+    ax.set_xticklabels(cats)
+    ax.set_ylabel("Firing rate (Hz)")
+    ax.set_xlabel(cat_col)
+    ax.legend(fontsize=8)
+    sns.despine(ax=ax)
+
+    if standalone:
+        plt.tight_layout()
+
+
+def plot_wtrack_comparison(uid, cov_df, n_bins=50, results=None, pos_run=None):
+    """Two-panel W-track heatmap: actual (left) vs GLM-predicted (right) firing rate.
+
+    When called before set_plot_state(), pass results= (fitted pos_spline model) and
+    pos_run= (DataFrame with linear_position, projected_x/y_position columns).
+    """
+    # Resolve pos_run
+    if pos_run is None:
+        pos_run = _plot_state["pos_run"]
+    if pos_run is None:
+        raise ValueError("pos_run must be provided via pos_run= or set_plot_state()")
+
+    # Resolve predicted rate
+    if _plot_state["rate_matrix"] is not None and results is None:
+        pred_rate_run = np.interp(
+            pos_run["linear_position"], _plot_state["pos_pred_vals"], _plot_state["rate_matrix"][uid]
+        )
+    elif results is not None:
+        pos_min = cov_df["linear_position"].min()
+        pos_max = cov_df["linear_position"].max()
+        pos_pred_vals_local = np.linspace(pos_min, pos_max, 300)
+        pos_pred_scaled = (pos_pred_vals_local - pos_min) / (pos_max - pos_min)
+        pred_hz = results.predict(pd.DataFrame({"pos_scaled": pos_pred_scaled})) / 0.002
+        pred_rate_run = np.interp(pos_run["linear_position"], pos_pred_vals_local, pred_hz)
+    else:
+        raise ValueError("Either call set_plot_state() first, or pass results=")
+
+    # Predicted rate interpolated onto pos_run positions — resolved above
+
+    # Empirical occupancy-normalized rate
+    valid = cov_df["linear_position"].notna()
+    actual_pos = cov_df.loc[valid, "linear_position"].values
+    spike_vals = cov_df.loc[valid, "spike_count"].values
+
+    occ,  bins = np.histogram(actual_pos, bins=n_bins)
+    spks, _    = np.histogram(actual_pos, bins=bins, weights=spike_vals)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        emp_rate_bins = np.where(occ > 0, spks / (occ * 0.002), 0.0)
+    bin_centers = (bins[:-1] + bins[1:]) / 2
+
+    # Interpolate empirical onto pos_run positions
+    actual_rate_run = np.interp(pos_run["linear_position"], bin_centers, emp_rate_bins)
+
+    vmax = np.nanpercentile(actual_rate_run, 99)
+    graph = sgpl.TrackGraph & {"track_graph_name": "Wtrack_wilbur20210512"}
+
+    fig, (ax_actual, ax_pred) = plt.subplots(1, 2, figsize=(14, 5))
+    for ax, rate_run, title in [
+        (ax_actual, actual_rate_run, f"unit {uid} — actual"),
+        (ax_pred,   pred_rate_run,   f"unit {uid} — GLM predicted"),
+    ]:
+        graph.plot_track_graph(ax=ax, draw_edge_labels=False)
+        for ln in ax.lines:
+            ln.set_color("lightgrey")
+        sc = ax.scatter(pos_run["projected_x_position"], pos_run["projected_y_position"],
+                        c=rate_run, cmap="hot_r", s=3, zorder=3, vmin=0, vmax=vmax)
+        plt.colorbar(sc, ax=ax, label="Hz", shrink=0.8)
+        ax.set_title(title)
+        ax.set_xlabel("x (cm)")
+        ax.set_ylabel("y (cm)")
+
+    plt.tight_layout()
+
+
 def plot_place_field_grid(unit_list, ncols=4):
     """Track heatmaps for a list of units arranged in a grid."""
     rate_matrix   = _plot_state["rate_matrix"]
