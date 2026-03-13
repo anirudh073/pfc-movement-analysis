@@ -182,7 +182,8 @@ def make_drop_one_specs(cov_df_common, spike_counts_common,
 def compute_drop_one_lrt(model_name, base_dir, drop_one_specs):
     """
     Load full model + all drop-one CSVs for model_name.
-    For each dropped term, compute per-unit LRT (full vs reduced) and delta AIC.
+    For each dropped term, compute per-unit LRT (full vs reduced), delta AIC,
+    and partial McFadden pseudo-R² = lrt_stat / deviance_null.
     Only includes units where both full and reduced models converged.
     Returns a long-form DataFrame with one row per (unit, dropped_term).
     """
@@ -212,8 +213,10 @@ def compute_drop_one_lrt(model_name, base_dir, drop_one_specs):
             aic_full    = full.loc[uid, "aic"]
             aic_reduced = reduced.loc[uid, "aic"]
 
-            lrt_stat = 2 * (llf_full - llf_reduced)
-            lrt_pval = 1 - chi2.cdf(lrt_stat, lrt_df) if lrt_df > 0 else np.nan
+            lrt_stat     = 2 * (llf_full - llf_reduced)
+            lrt_pval     = 1 - chi2.cdf(lrt_stat, lrt_df) if lrt_df > 0 else np.nan
+            deviance_null = full.loc[uid, "deviance_null"]
+            partial_r2   = lrt_stat / deviance_null if deviance_null > 0 else np.nan
 
             rows.append(dict(
                 unit         = uid,
@@ -223,7 +226,8 @@ def compute_drop_one_lrt(model_name, base_dir, drop_one_specs):
                 lrt_df       = lrt_df,
                 lrt_pval     = lrt_pval,
                 significant  = bool(lrt_pval < 0.05) if not np.isnan(lrt_pval) else False,
-                delta_aic    = aic_full - aic_reduced,  # negative = full model better
+                delta_aic    = aic_full - aic_reduced,  # negative = full model better; kept for non-nested comparisons
+                partial_r2   = partial_r2,               # N-invariant: lrt_stat / deviance_null
             ))
 
         if n_skipped:
@@ -234,9 +238,9 @@ def compute_drop_one_lrt(model_name, base_dir, drop_one_specs):
 
 def apply_fdr_correction(drop_one_results,
                          alpha = 0.05):
-    df = drop_one_results.copy()
+    df = drop_one_results.copy().reset_index(drop=True)
     df["significant_fdr"] = False
-    
+
     for (model, term), group in df.groupby(["model", "dropped_term"]):
         valid = group["lrt_pval"].notna()
         pvals = group.loc[valid, "lrt_pval"].values
@@ -245,8 +249,9 @@ def apply_fdr_correction(drop_one_results,
             continue
         
         reject = multipletests(pvals, method = 'fdr_bh', alpha = alpha)[0]
-        
-        df.loc[valid, "significant_fdr"] = reject
+
+        valid_idx = group.index[valid.values]
+        df.loc[valid_idx, "significant_fdr"] = reject
         
     return df
     
@@ -256,7 +261,7 @@ def pairwise_term_comparison(drop_one_results: pd.DataFrame,
                              term_labels = None,
                              alpha = 0.05):
     df = drop_one_results[drop_one_results["model"]==model_name]
-    df_wide = df.pivot(index = "unit", columns = "dropped_term", values = "delta_aic")
+    df_wide = df.pivot(index = "unit", columns = "dropped_term", values = "partial_r2")
     
     a_list = []
     b_list = []
@@ -265,7 +270,7 @@ def pairwise_term_comparison(drop_one_results: pd.DataFrame,
         columnA = df_wide[A]
         columnB = df_wide[B]
         valid = pd.concat([columnA, columnB], axis =1, join = "inner").dropna().index
-        stat, pvals = wilcoxon(columnA.loc[valid], columnB.loc[valid], zero_method = "wilcoxon", alternative = "two_sided", method = "auto")
+        stat, pvals = wilcoxon(columnA.loc[valid], columnB.loc[valid], zero_method = "wilcox", alternative = "two-sided", method = "auto")
         a_list.append(A)
         b_list.append(B)
         pvals_list.append(pvals)
@@ -295,14 +300,15 @@ TERM_LABELS = {
 
 
 def plot_drop_one_summary(drop_one_results, pairwise_pvals=None,
-                          heatmap_model="full_model_all", term_labels=None):
+                          heatmap_model="full_model_all", term_labels=None,
+                          r2_thresholds=(0.01, 0.05, 0.10)):
     """3-panel drop-one summary.
 
-    Panel A : % units significant — raw p<0.05 vs FDR q<0.05
-    Panel B : delta-AIC violin per term (effect size distribution)
+    Panel A : % units where partial_r2 > threshold (N-invariant unique contribution)
+    Panel B : partial_r2 violin per term (effect size distribution)
     Panel C : pairwise q-value heatmap with significance annotations
 
-    Requires drop_one_results to have 'significant_fdr' (run apply_fdr_correction first).
+    r2_thresholds : tuple of partial R² thresholds for bar groups (default: 0.01, 0.05, 0.10).
     pairwise_pvals : output of pairwise_term_comparison() — optional, skips Panel C if None.
     """
     if term_labels is None:
@@ -311,38 +317,41 @@ def plot_drop_one_summary(drop_one_results, pairwise_pvals=None,
     df = drop_one_results.copy()
     df["term_label"] = df["dropped_term"].map(term_labels).fillna(df["dropped_term"])
 
-    has_fdr = "significant_fdr" in df.columns
-    agg = (df.groupby("term_label")
-             .agg(raw=("significant", "mean"),
-                  **({'fdr': ("significant_fdr", "mean")} if has_fdr else {}))
-             .sort_values("raw", ascending=False))
-
-    term_order = (df.groupby("term_label")["delta_aic"]
-                    .median().sort_values().index.tolist())
+    term_order = (df.groupby("term_label")["partial_r2"]
+                    .median().sort_values(ascending=False).index.tolist())
 
     ncols = 3 if pairwise_pvals is not None else 2
     fig, axes = plt.subplots(1, ncols, figsize=(6 * ncols, 5))
 
-    # A ── % significant
+    # A ── % units above partial R² threshold
     ax = axes[0]
-    x, w = np.arange(len(agg)), 0.35
-    ax.bar(x - w/2, agg["raw"] * 100, w, color="steelblue", alpha=0.85, label="raw p<0.05")
-    if has_fdr:
-        ax.bar(x + w/2, agg["fdr"] * 100, w, color="tomato", alpha=0.85, label="FDR q<0.05")
-    ax.axhline(5, color="grey", lw=1, ls="--", label="5%")
-    ax.set_xticks(x); ax.set_xticklabels(agg.index, rotation=25, ha="right")
-    ax.set_ylabel("% units significant")
-    ax.set_title("Unique contribution — significance")
+    agg_order = (df.groupby("term_label")["partial_r2"]
+                   .apply(lambda x: (x > r2_thresholds[0]).mean())
+                   .sort_values(ascending=False).index.tolist())
+    x = np.arange(len(agg_order))
+    colors = ["steelblue", "tomato", "forestgreen"]
+    w_total = 0.7
+    w = w_total / len(r2_thresholds)
+    for k, thresh in enumerate(r2_thresholds):
+        pct = [
+            (df[df["term_label"] == t]["partial_r2"] > thresh).mean() * 100
+            for t in agg_order
+        ]
+        offset = (k - (len(r2_thresholds) - 1) / 2) * w
+        ax.bar(x + offset, pct, w, color=colors[k % len(colors)],
+               alpha=0.85, label=f"partial R² > {thresh:.2f}")
+    ax.set_xticks(x); ax.set_xticklabels(agg_order, rotation=25, ha="right")
+    ax.set_ylabel("% units"); ax.set_title("Unique contribution (partial R²)")
     ax.legend(fontsize=8); sns.despine(ax=ax)
 
     # B ── effect size violin
     ax = axes[1]
-    sns.violinplot(data=df, x="delta_aic", y="term_label", order=term_order,
+    sns.violinplot(data=df, x="partial_r2", y="term_label", order=term_order,
                    inner="box", cut=0, color="steelblue", ax=ax)
-    ax.axvline(0, color="red", lw=1, ls="--")
-    ax.set_xlabel("ΔAIC (full − reduced)\nnegative = full model better")
-    ax.set_ylabel(""); ax.set_title("Effect size distribution")
-    sns.despine(ax=ax)
+    ax.axvline(0, color="red", lw=1, ls="--", label="0")
+    ax.set_xlabel("Partial R² (lrt_stat / null deviance)")
+    ax.set_ylabel(""); ax.set_title("Effect size (partial R²)")
+    ax.legend(fontsize=8); sns.despine(ax=ax)
 
     # C ── pairwise heatmap
     if pairwise_pvals is not None:
