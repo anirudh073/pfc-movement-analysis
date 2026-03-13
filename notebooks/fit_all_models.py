@@ -7,17 +7,21 @@ Fits run sequentially; progress is printed with timing.
 The notebook can load finished CSVs at any time while this script is running.
 """
 
-import os, time
+import os, time, warnings
 import numpy as np
+
+warnings.filterwarnings("ignore", category=RuntimeWarning)
 import pandas as pd
 import statsmodels.api as sm
 import statsmodels.formula.api as smf
-from patsy import bs
+from patsy import bs, cr
 
 os.chdir("/media/labuser/NA_1_2025/spyglass/wilbur")
 
 base_dir = "/media/labuser/NA_1_2025/spyglass/wilbur"
 BIN_SIZE = 0.002
+tp_df = 6
+
 
 # ── load data ─────────────────────────────────────────────────────────────────
 print("Loading data...")
@@ -37,7 +41,12 @@ print(f"  {len(mpfc_spikes)} units, {spike_counts.shape[1]:,} total bins")
 # ── interpolate covariates to 2ms bins ───────────────────────────────────────
 def interp_col(col_values, times, bin_centers):
     if pd.api.types.is_numeric_dtype(col_values):
-        return np.interp(bin_centers, times, col_values.astype(float))
+        vals = col_values.astype(float)
+        valid = ~np.isnan(vals)
+        if valid.sum() < 2:
+            return np.full(len(bin_centers), np.nan)
+        # Exclude NaN anchor points — np.interp propagates NaN from any bracketing point
+        return np.interp(bin_centers, times[valid], vals[valid], left=np.nan, right=np.nan)
     else:
         idx = np.searchsorted(times, bin_centers).clip(0, len(times) - 1)
         return col_values.iloc[idx].values
@@ -124,46 +133,81 @@ def fit_and_save(name, formula, df, sc, path, keep_null=False):
     print(f"  Done in {elapsed:.0f}s — {n_converged}/{len(unit_ids)} converged → {path}")
 
 # ── fit all models ─────────────────────────────────────────────────────────────
-fit_and_save(
-    "null", "spike_count ~ 1",
-    cov_df_common, spike_counts_common,
-    f"{base_dir}/analysis/null_model_all.csv"
-)
+# fit_and_save(
+#     "null", "spike_count ~ 1",
+#     cov_df_common, spike_counts_common,
+#     f"{base_dir}/analysis/null_model_all.csv"
+# )
+
+# fit_and_save(
+#     "null_out", "spike_count ~ 1",
+#     cov_df_out_common, spike_counts_out_common,
+#     f"{base_dir}/analysis/null_model_out_all.csv"
+# )
+
+# fit_and_save(
+#     "trial_type", "spike_count ~ trial_type",
+#     cov_df_common, spike_counts_common,
+#     f"{base_dir}/analysis/trial_type_model_all.csv"
+# )
+
+# fit_and_save(
+#     "choice", "spike_count ~ choice",
+#     cov_df_out_common, spike_counts_out_common,
+#     f"{base_dir}/analysis/choice_model_all.csv"
+# )
+
+# fit_and_save(
+#     "speed", "spike_count ~ speed",
+#     cov_df_common, spike_counts_common,
+#     f"{base_dir}/analysis/speed_model_all.csv"
+# )
+
+# fit_and_save(
+#     "speed_spline", f"spike_count ~ bs(speed_scaled, df=4)",
+#     cov_df_common, spike_counts_common,
+#     f"{base_dir}/analysis/speed_spline_model_all.csv"
+# )
+
+# fit_and_save(
+#     "pos_spline", "spike_count ~ bs(pos_scaled, df=8)",
+#     cov_df_common, spike_counts_common,
+#     f"{base_dir}/analysis/pos_spline_model_all.csv"
+# )
+
+# fit_and_save(
+#     "trial_progress_spline", f"spike_count ~ cr(trial_progress, df={tp_df}, constraints='center')",
+#     cov_df_common, spike_counts_common,
+#     f"{base_dir}/analysis/trial_progress_spline_model_all.csv"
+# )
+
+# ── multi-variable models ──────────────────────────────────────────────────────
+# fit_and_save(
+#     "full_model",
+#     "spike_count ~ trial_type + bs(pos_scaled, df=8) + bs(speed_scaled, df=4)",
+#     cov_df_common, spike_counts_common,
+#     f"{base_dir}/analysis/full_model_all.csv"
+# )
+
+# fit_and_save(
+#     "temporal_model",
+#     f"spike_count ~ trial_type + cr(trial_progress, df={tp_df}, constraints='center') + bs(speed_scaled, df=4)",
+#     cov_df_common, spike_counts_common,
+#     f"{base_dir}/analysis/temporal_model_all.csv"
+# )
+
+# fit_and_save(
+#     "choice_full_model",
+#     "spike_count ~ choice + bs(pos_scaled, df=8) + bs(speed_scaled, df=4)",
+#     cov_df_out_common, spike_counts_out_common,
+#     f"{base_dir}/analysis/choice_full_model_all.csv"
+# )
 
 fit_and_save(
-    "null_out", "spike_count ~ 1",
+    "choice_temporal_model",
+    f"spike_count ~ choice + cr(trial_progress, df={tp_df}, constraints='center') + bs(speed_scaled, df=4)",
     cov_df_out_common, spike_counts_out_common,
-    f"{base_dir}/analysis/null_model_out_all.csv"
-)
-
-fit_and_save(
-    "trial_type", "spike_count ~ trial_type",
-    cov_df_common, spike_counts_common,
-    f"{base_dir}/analysis/trial_type_model_all.csv"
-)
-
-fit_and_save(
-    "choice", "spike_count ~ choice",
-    cov_df_out_common, spike_counts_out_common,
-    f"{base_dir}/analysis/choice_model_all.csv"
-)
-
-fit_and_save(
-    "speed", "spike_count ~ speed",
-    cov_df_common, spike_counts_common,
-    f"{base_dir}/analysis/speed_model_all.csv"
-)
-
-fit_and_save(
-    "speed_spline", f"spike_count ~ bs(speed_scaled, df=4)",
-    cov_df_common, spike_counts_common,
-    f"{base_dir}/analysis/speed_spline_model_all.csv"
-)
-
-fit_and_save(
-    "pos_spline", "spike_count ~ bs(pos_scaled, df=8)",
-    cov_df_common, spike_counts_common,
-    f"{base_dir}/analysis/pos_spline_model_all.csv"
+    f"{base_dir}/analysis/choice_temporal_model_all.csv"
 )
 
 print("\nAll models done.")
