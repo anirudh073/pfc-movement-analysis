@@ -6,7 +6,9 @@ Sections:
   2. GLM fitting       — fit_glm_all_units
   3. Drop-one analysis — make_drop_one_specs, build_reduced_formula,
                          fit_drop_one, run_drop_one_suite, compute_drop_one_lrt
-  4. Visualization     — set_plot_state, plot_place_field, plot_place_field_grid
+  4. Diagnostics       — compute_residuals, plot_residuals,
+                         compute_ks_rescaled, plot_ks, plot_diagnostics
+  5. Visualization     — set_plot_state, plot_place_field, plot_place_field_grid
 """
 
 import os, re
@@ -14,12 +16,11 @@ import numpy as np
 import pandas as pd
 import statsmodels.api as sm
 import statsmodels.formula.api as smf
-from scipy.stats import chi2
+from scipy.stats import chi2, wilcoxon, spearmanr
 import matplotlib.pyplot as plt
 import seaborn as sns
 import spyglass.linearization.v1 as sgpl
 from statsmodels.stats.multitest import multipletests
-from scipy.stats import wilcoxon
 import itertools
 
 
@@ -382,7 +383,763 @@ def plot_drop_one_summary(drop_one_results, pairwise_pvals=None,
 
 
 
-# ── 4. Visualization ──────────────────────────────────────────────────────────
+# ── 4. Diagnostics — residuals & KS test ─────────────────────────────────────
+
+def compute_residuals(results, spike_counts, cov_df):
+    """
+    Compute per-bin raw and cumulative residuals for a fitted Poisson GLM.
+
+    raw_residual_i      = observed_i - predicted_i   (spike counts per bin)
+    cumulative_residual = cumsum(raw_residual)        (integrated misfit)
+
+    Returns a copy of cov_df with two extra columns:
+      raw_residual        : observed minus E[N|X] per bin
+      cumulative_residual : running cumulative sum of raw_residual over time
+
+    Parameters
+    ----------
+    results      : fitted statsmodels GLM result object (res.predict() must work)
+    spike_counts : 1-D array, shape (n_bins,), observed spike counts for one unit
+    cov_df       : covariate DataFrame used to fit the model (n_bins rows)
+    """
+    predicted = np.asarray(results.predict())
+    raw = np.asarray(spike_counts, dtype=float) - predicted
+
+    df = cov_df.copy().reset_index(drop=True)
+    df["raw_residual"]        = raw
+    df["cumulative_residual"] = np.cumsum(raw)
+    return df
+
+
+def plot_residuals(residuals_df, covariate_cols, n_bins=50, title=""):
+    """
+    Diagnostic plots of model residuals.
+
+    Panel 1 — cumulative residual vs time:
+        The running sum of (observed - predicted) over bins. Under a well-specified
+        model this is a zero-mean random walk; a trend indicates slow drift
+        (arousal, electrode drift) that no covariate captures.
+
+    Panels 2+ — mean raw residual vs each covariate:
+        Each panel bins one covariate and shows the average per-bin misfit.
+        A flat curve near zero indicates the model captures that covariate well;
+        systematic shape indicates unmodelled nonlinearity or missing interaction.
+
+    Parameters
+    ----------
+    residuals_df   : output of compute_residuals()
+    covariate_cols : list of column names in residuals_df to plot against
+    n_bins         : number of quantile bins for covariate plots
+    title          : overall figure suptitle
+    """
+    n_panels = 1 + len(covariate_cols)
+    fig, axes = plt.subplots(1, n_panels, figsize=(5 * n_panels, 4))
+    axes = np.atleast_1d(axes)
+
+    # Panel 1: cumulative residual vs time
+    ax = axes[0]
+    ax.plot(residuals_df["cumulative_residual"].values, lw=0.6, color="steelblue")
+    ax.axhline(0, color="red", lw=1, ls="--")
+    ax.set_xlabel("Bin index (time)")
+    ax.set_ylabel("Cumulative residual (spikes)")
+    ax.set_title("Cumulative residual vs time")
+    sns.despine(ax=ax)
+
+    # Panels 2+: mean raw residual binned by each covariate
+    for k, col in enumerate(covariate_cols):
+        ax = axes[1 + k]
+        valid = residuals_df[col].notna()
+        cov_vals = residuals_df.loc[valid, col].values
+        res_vals = residuals_df.loc[valid, "raw_residual"].values
+
+        # Binned mean residual: average misfit at each covariate value
+        bins   = np.linspace(cov_vals.min(), cov_vals.max(), n_bins + 1)
+        idx    = np.digitize(cov_vals, bins) - 1
+        idx    = np.clip(idx, 0, n_bins - 1)
+        centers     = (bins[:-1] + bins[1:]) / 2
+        mean_resid  = np.array([res_vals[idx == b].mean() if (idx == b).any() else np.nan
+                                 for b in range(n_bins)])
+
+        # CUSUM: sort bins by covariate value, cumulative residual
+        sort_order  = np.argsort(cov_vals)
+        cusum       = np.cumsum(res_vals[sort_order])
+        x_cusum     = cov_vals[sort_order]
+
+        ax.plot(x_cusum, cusum, lw=0.8, color="tomato", alpha=0.7, label="CUSUM")
+        ax2 = ax.twinx()
+        ax2.bar(centers, mean_resid, width=(bins[1] - bins[0]) * 0.9,
+                color="steelblue", alpha=0.4, label="Mean residual")
+        ax2.axhline(0, color="black", lw=0.8, ls="--")
+        ax2.set_ylabel("Mean residual (spikes/bin)", fontsize=8)
+
+        ax.set_xlabel(col)
+        ax.set_ylabel("CUSUM (spikes)", fontsize=8)
+        ax.set_title(f"Residual vs {col}")
+        lines1, labels1 = ax.get_legend_handles_labels()
+        lines2, labels2 = ax2.get_legend_handles_labels()
+        ax.legend(lines1 + lines2, labels1 + labels2, fontsize=7)
+        sns.despine(ax=ax)
+
+    if title:
+        fig.suptitle(title, fontsize=12)
+    plt.tight_layout()
+
+
+def _compute_z_unsorted(predicted, spike_counts):
+    """
+    Core ISI rescaling: returns z values in temporal (ISI) order, not sorted.
+    Used by compute_ks_rescaled (needs sorted) and compute_diagnostics_all_units
+    (needs temporal order for autocorrelation).
+    """
+    counts    = np.asarray(spike_counts, dtype=int)
+    spike_idx = np.where(counts > 0)[0]
+    if len(spike_idx) < 2:
+        return np.array([])
+    z_vals = []
+    for i in range(1, len(spike_idx)):
+        start = spike_idx[i - 1] + 1
+        end   = spike_idx[i]     + 1
+        u_i   = predicted[start:end].sum()
+        z_vals.append(1.0 - np.exp(-u_i))
+    return np.array(z_vals)
+
+
+def compute_ks_rescaled(results, spike_counts):
+    """
+    Apply the Time Rescaling Theorem to obtain Uniform(0,1) test statistics.
+
+    For a Poisson GLM with predicted counts λ_j·Δt per bin, the integrated
+    intensity across the ISI from spike i-1 to spike i is:
+
+        u_i = Σ_{j = idx[i-1]+1}^{idx[i]} predicted_j
+
+    Under a correct model, u_i ~ Exponential(1). Transforming:
+
+        z_i = 1 - exp(-u_i)  →  z_i ~ Uniform(0, 1)
+
+    The KS plot (empirical CDF of z_i vs diagonal) diagnoses specific failures:
+      - Bows above diagonal : model underestimates rate at short ISIs (bursting)
+      - Bows below diagonal : model overestimates rate (suppression not modelled)
+      - S-shape             : correct mean rate, wrong temporal structure
+      - Autocorrelated z_i  : unmodelled spike history / refractoriness
+
+    Returns z_vals sorted ascending — pass directly to plot_ks().
+
+    Parameters
+    ----------
+    results      : fitted statsmodels GLM result
+    spike_counts : 1-D int array, shape (n_bins,), observed spike counts
+    """
+    predicted = np.asarray(results.predict())
+    return np.sort(_compute_z_unsorted(predicted, spike_counts))
+
+
+def plot_ks(z_vals, alpha=0.05, ax=None, title="KS plot (time-rescaling)"):
+    """
+    KS plot: empirical CDF of rescaled ISIs vs Uniform(0,1) reference diagonal.
+
+    95% confidence bands use the Kolmogorov–Smirnov distribution:
+        ε = sqrt(−log(α/2) / (2n))
+
+    Parameters
+    ----------
+    z_vals : sorted array from compute_ks_rescaled()
+    alpha  : confidence level for bands (default 0.05 → 95% CI)
+    ax     : matplotlib Axes; creates a new figure if None
+    title  : plot title
+    """
+    standalone = ax is None
+    if standalone:
+        fig, ax = plt.subplots(figsize=(5, 5))
+
+    n = len(z_vals)
+    if n == 0:
+        ax.text(0.5, 0.5, "No ISIs", ha="center", va="center", transform=ax.transAxes)
+        return
+
+    ecdf    = np.arange(1, n + 1) / n
+    epsilon = np.sqrt(-np.log(alpha / 2) / (2 * n))
+
+    ax.fill_between(
+        z_vals,
+        np.clip(ecdf - epsilon, 0, 1),
+        np.clip(ecdf + epsilon, 0, 1),
+        alpha=0.2, color="steelblue", label=f"{int((1 - alpha) * 100)}% CI"
+    )
+    ax.plot(z_vals, ecdf, color="steelblue", lw=1.5, label="Empirical CDF")
+    ax.plot([0, 1], [0, 1], "k--", lw=1, label="Uniform(0,1)")
+    ax.set_xlabel("z  (rescaled ISI)")
+    ax.set_ylabel("Empirical CDF")
+    ax.set_title(title)
+    ax.legend(fontsize=8)
+    sns.despine(ax=ax)
+
+    if standalone:
+        plt.tight_layout()
+
+
+def plot_diagnostics_batch(unit_list, formula, cov_df, spike_counts_masked, unit_ids,
+                           covariate_cols=None, n_bins=50, alpha=0.05):
+    """
+    Fit GLM and run full diagnostics for a chosen list of units (max 5).
+
+    Produces one row per unit with columns:
+      [cumulative residual vs time] [mean residual vs cov1] ... [KS plot]
+
+    Parameters
+    ----------
+    unit_list           : list of unit IDs to inspect (truncated to 5 if longer)
+    formula             : GLM formula string used for fitting
+    cov_df              : covariate DataFrame (n_bins rows, no spike_count column)
+    spike_counts_masked : 2-D array (n_units × n_bins), observed spike counts
+    unit_ids            : 1-D array of unit IDs, same order as spike_counts_masked rows
+    covariate_cols      : column names in cov_df to plot residuals against
+    n_bins              : number of bins for covariate residual panels
+    alpha               : CI level for KS confidence band (default 0.05)
+    """
+    if covariate_cols is None:
+        covariate_cols = []
+
+    if len(unit_list) > 5:
+        print(f"unit_list has {len(unit_list)} entries — truncating to first 5")
+        unit_list = unit_list[:5]
+
+    unit_ids_arr = np.asarray(unit_ids)
+    n_rows = len(unit_list)
+    n_cols = 1 + len(covariate_cols) + 1   # time | covariates... | KS
+
+    fig, axes = plt.subplots(
+        n_rows, n_cols,
+        figsize=(4.5 * n_cols, 3.5 * n_rows),
+        constrained_layout=True,
+    )
+    axes = np.array(axes).reshape(n_rows, n_cols)
+
+    col_titles = (["Cumul. resid. vs time"]
+                  + [f"Resid. vs {c}" for c in covariate_cols]
+                  + ["KS plot"])
+
+    for row_idx, uid in enumerate(unit_list):
+        matches = np.where(unit_ids_arr == uid)[0]
+        if len(matches) == 0:
+            for ax in axes[row_idx]:
+                ax.text(0.5, 0.5, f"unit {uid}\nnot found",
+                        ha="center", va="center", transform=ax.transAxes, fontsize=9)
+            continue
+        i = matches[0]
+
+        # ── fit GLM ───────────────────────────────────────────────────────────
+        df = cov_df.copy()
+        df["spike_count"] = spike_counts_masked[i]
+        try:
+            res = smf.glm(formula, data=df, family=sm.families.Poisson()).fit(disp=False)
+            if not res.converged:
+                raise RuntimeError("did not converge")
+        except Exception as e:
+            for ax in axes[row_idx]:
+                ax.text(0.5, 0.5, f"unit {uid}\nfit failed\n{e}",
+                        ha="center", va="center", transform=ax.transAxes, fontsize=8)
+            continue
+
+        predicted = np.asarray(res.predict())
+        raw       = spike_counts_masked[i].astype(float) - predicted
+        cumresid  = np.cumsum(raw)
+
+        # ── Panel 0: cumulative residual vs time ──────────────────────────────
+        ax = axes[row_idx, 0]
+        ax.plot(cumresid, lw=0.6, color="steelblue")
+        ax.axhline(0, color="red", lw=1, ls="--")
+        ax.set_xlabel("Bin index (time)", fontsize=8)
+        ax.set_ylabel(f"unit {uid}\ncumul. resid.", fontsize=8)
+        ax.tick_params(labelsize=7)
+        sns.despine(ax=ax)
+
+        # ── Panels 1..N: mean raw residual vs each covariate ─────────────────
+        for k, col in enumerate(covariate_cols):
+            ax = axes[row_idx, 1 + k]
+            valid    = ~np.isnan(cov_df[col].values)
+            cov_vals = cov_df[col].values[valid]
+            res_vals = raw[valid]
+
+            bins        = np.linspace(cov_vals.min(), cov_vals.max(), n_bins + 1)
+            bin_idx     = np.clip(np.digitize(cov_vals, bins) - 1, 0, n_bins - 1)
+            centers     = (bins[:-1] + bins[1:]) / 2
+            mean_resid  = np.array([
+                res_vals[bin_idx == b].mean() if (bin_idx == b).any() else np.nan
+                for b in range(n_bins)
+            ])
+
+            ax.plot(centers, mean_resid, lw=1.2, color="steelblue")
+            ax.axhline(0, color="red", lw=1, ls="--")
+            ax.set_xlabel(col, fontsize=8)
+            ax.set_ylabel("Mean resid.\n(spikes/bin)", fontsize=8)
+            ax.tick_params(labelsize=7)
+            sns.despine(ax=ax)
+
+        # Equalise y-axis limits across all covariate panels for this unit
+        # so magnitudes are directly comparable across covariates
+        if len(covariate_cols) > 1:
+            cov_axes  = [axes[row_idx, 1 + k] for k in range(len(covariate_cols))]
+            max_abs   = max(max(abs(y) for y in ax.get_ylim()) for ax in cov_axes)
+            for ax in cov_axes:
+                ax.set_ylim(-max_abs, max_abs)
+
+        # ── Last panel: KS plot ───────────────────────────────────────────────
+        ax   = axes[row_idx, -1]
+        z    = compute_ks_rescaled(res, spike_counts_masked[i])
+        n    = len(z)
+        if n > 0:
+            ecdf    = np.arange(1, n + 1) / n
+            epsilon = np.sqrt(-np.log(alpha / 2) / (2 * n))
+            ax.fill_between(z, np.clip(ecdf - epsilon, 0, 1),
+                            np.clip(ecdf + epsilon, 0, 1),
+                            alpha=0.2, color="steelblue")
+            ax.plot(z, ecdf, color="steelblue", lw=1.5)
+            ax.plot([0, 1], [0, 1], "k--", lw=1)
+
+            D = np.max(np.abs(ecdf - z))
+            passed = D <= epsilon
+            label  = "pass" if passed else "FAIL"
+            color  = "green" if passed else "red"
+            ax.text(0.05, 0.90, f"D = {D:.3f}  {label}",
+                    transform=ax.transAxes, fontsize=8,
+                    color=color, fontweight="bold")
+
+        ax.set_xlabel("z (rescaled ISI)", fontsize=8)
+        ax.set_ylabel("Empirical CDF", fontsize=8)
+        ax.tick_params(labelsize=7)
+        sns.despine(ax=ax)
+
+    # Column titles on first row only
+    for col_idx, title in enumerate(col_titles):
+        axes[0, col_idx].set_title(title, fontsize=9, fontweight="bold")
+
+    fig.suptitle("GLM diagnostics — selected units", fontsize=12)
+
+
+def plot_diagnostics(results, spike_counts, cov_df, covariate_cols,
+                     n_bins=50, unit_label="", alpha=0.05):
+    """
+    Full diagnostic dashboard for one unit's fitted Poisson GLM.
+
+    Calls compute_residuals → plot_residuals (cumulative + covariate panels),
+    then compute_ks_rescaled → plot_ks in a separate figure.
+
+    Parameters
+    ----------
+    results        : fitted statsmodels GLM result
+    spike_counts   : 1-D array (n_bins,) for this unit
+    cov_df         : covariate DataFrame (n_bins rows)
+    covariate_cols : list of column names to show residuals against
+    n_bins         : bins for covariate residual plots
+    unit_label     : string identifier shown in plot titles
+    alpha          : CI level for KS bands (default 0.05)
+    """
+    residuals_df = compute_residuals(results, spike_counts, cov_df)
+    plot_residuals(residuals_df, covariate_cols, n_bins=n_bins,
+                   title=f"Residuals — {unit_label}")
+
+    z_vals = compute_ks_rescaled(results, spike_counts)
+    fig, ax = plt.subplots(figsize=(5, 5))
+    plot_ks(z_vals, alpha=alpha, ax=ax, title=f"KS — {unit_label}")
+    plt.tight_layout()
+
+
+def compute_model_diagnostics(formula, cov_df, spike_counts_masked, unit_ids,
+                               covariate_cols, base_dir, model_name,
+                               n_bins=50, unit_subset=None):
+    """
+    Fit GLM once per unit and compute both scalar diagnostics and residual profiles.
+
+    Saves two files (skipped when unit_subset is given):
+      {base_dir}/analysis/diagnostics_{model_name}.csv       — scalar diagnostics
+      {base_dir}/analysis/residual_profiles_{model_name}.npz — binned profiles
+
+    If both files already exist, loads and returns them without refitting.
+
+    Scalars per unit
+    ----------------
+    ks_D             : KS D = max|ECDF(z) − z|. Overall spike-timing misfit.
+    ks_z_autocorr    : Spearman r(z_i, z_{i+1}). Serial ISI structure.
+    drift_auc        : mean(|cumresid|) / n_spikes. Temporal non-stationarity.
+    resid_eta2_{col} : η² = Σ(n_b × mean_b²) / Σ(raw²). Covariate misfit fraction.
+
+    Returns
+    -------
+    diag_df  : DataFrame of scalar diagnostics (one row per unit)
+    profiles : dict with "{col}_profiles" (n_units × n_bins), "{col}_centers", "unit_ids"
+    """
+    csv_path = f"{base_dir}/analysis/diagnostics_{model_name}.csv"
+    npz_path = f"{base_dir}/analysis/residual_profiles_{model_name}.npz"
+
+    if unit_subset is None and os.path.exists(csv_path) and os.path.exists(npz_path):
+        print(f"Loading existing: {csv_path}")
+        diag_df = pd.read_csv(csv_path, index_col=0)
+        raw_npz = np.load(npz_path, allow_pickle=True)
+        profiles = {k: raw_npz[k] for k in raw_npz.files}
+        return diag_df, profiles
+
+    unit_ids_arr = np.asarray(unit_ids)
+    if unit_subset is not None:
+        uid_set  = set(unit_subset)
+        indices  = [i for i, uid in enumerate(unit_ids_arr) if uid in uid_set]
+    else:
+        indices  = list(range(len(unit_ids_arr)))
+
+    # ── pre-compute bin edges for profiles ────────────────────────────────────
+    bin_edges   = {}
+    bin_centers = {}
+    for col in covariate_cols:
+        valid = cov_df[col].dropna().values
+        edges = np.linspace(valid.min(), valid.max(), n_bins + 1)
+        bin_edges[col]   = edges
+        bin_centers[col] = (edges[:-1] + edges[1:]) / 2
+
+    diag_rows      = []
+    profile_rows   = {col: [] for col in covariate_cols}
+    valid_prof_ids = []
+
+    for count, i in enumerate(indices):
+        uid = unit_ids_arr[i]
+        df  = cov_df.copy()
+        df["spike_count"] = spike_counts_masked[i]
+
+        try:
+            res = smf.glm(formula, data=df,
+                          family=sm.families.Poisson()).fit(disp=False)
+            if not res.converged:
+                raise RuntimeError("not converged")
+        except Exception:
+            row = dict(unit=uid, converged=False,
+                       ks_D=np.nan, ks_z_autocorr=np.nan, drift_auc=np.nan)
+            for col in covariate_cols:
+                row[f"resid_eta2_{col}"] = np.nan
+            diag_rows.append(row)
+            continue
+
+        predicted = np.asarray(res.predict())
+        raw       = spike_counts_masked[i].astype(float) - predicted
+        n_spikes  = int((spike_counts_masked[i] > 0).sum())
+
+        # ── drift AUC ─────────────────────────────────────────────────────────
+        cumresid  = np.cumsum(raw)
+        drift_auc = np.abs(cumresid).mean() / max(n_spikes, 1)
+
+        # ── KS D + z autocorrelation ──────────────────────────────────────────
+        z_unsorted = _compute_z_unsorted(predicted, spike_counts_masked[i])
+        if len(z_unsorted) >= 4:
+            z_sorted      = np.sort(z_unsorted)
+            n             = len(z_sorted)
+            ecdf          = np.arange(1, n + 1) / n
+            ks_D          = float(np.max(np.abs(ecdf - z_sorted)))
+            z_autocorr, _ = spearmanr(z_unsorted[:-1], z_unsorted[1:])
+        else:
+            ks_D, z_autocorr = np.nan, np.nan
+
+        # ── residual η² per covariate ─────────────────────────────────────────
+        row      = dict(unit=uid, converged=True,
+                        ks_D=ks_D, ks_z_autocorr=float(z_autocorr), drift_auc=drift_auc)
+        ss_total = float(np.sum(raw ** 2))
+        for col in covariate_cols:
+            valid_mask = ~np.isnan(cov_df[col].values)
+            if valid_mask.sum() > 10 and ss_total > 0:
+                cov_vals = cov_df[col].values[valid_mask]
+                res_vals = raw[valid_mask]
+                bins     = np.linspace(cov_vals.min(), cov_vals.max(), 51)
+                bin_idx  = np.clip(np.digitize(cov_vals, bins) - 1, 0, 49)
+                ss_between = sum(
+                    (res_vals[bin_idx == b].mean() ** 2) * (bin_idx == b).sum()
+                    for b in range(50) if (bin_idx == b).any()
+                )
+                row[f"resid_eta2_{col}"] = float(ss_between / ss_total)
+            else:
+                row[f"resid_eta2_{col}"] = np.nan
+        diag_rows.append(row)
+
+        # ── residual profiles ─────────────────────────────────────────────────
+        for col in covariate_cols:
+            valid_mask = ~np.isnan(cov_df[col].values)
+            cov_vals   = cov_df[col].values[valid_mask]
+            res_vals   = raw[valid_mask]
+            idx        = np.clip(np.digitize(cov_vals, bin_edges[col]) - 1, 0, n_bins - 1)
+            means      = np.array([
+                res_vals[idx == b].mean() if (idx == b).any() else np.nan
+                for b in range(n_bins)
+            ])
+            profile_rows[col].append(means)
+        valid_prof_ids.append(uid)
+
+        if (count + 1) % 50 == 0:
+            print(f"  {count + 1}/{len(indices)} units done")
+
+    diag_df  = pd.DataFrame(diag_rows)
+    profiles = {"unit_ids": np.array(valid_prof_ids)}
+    for col in covariate_cols:
+        profiles[f"{col}_profiles"] = np.array(profile_rows[col])
+        profiles[f"{col}_centers"]  = bin_centers[col]
+
+    if unit_subset is None:
+        diag_df.to_csv(csv_path)
+        print(f"Saved → {csv_path}")
+        np.savez(npz_path, **profiles)
+        print(f"Saved → {npz_path}")
+
+    return diag_df, profiles
+
+
+def compute_diagnostics_all_units(formula, cov_df, spike_counts_masked, unit_ids,
+                                   covariate_cols, base_dir, model_name,
+                                   unit_subset=None):
+    """Thin wrapper — calls compute_model_diagnostics and returns only diag_df."""
+    diag_df, _ = compute_model_diagnostics(
+        formula, cov_df, spike_counts_masked, unit_ids,
+        covariate_cols, base_dir, model_name,
+        unit_subset=unit_subset,
+    )
+    return diag_df
+
+
+def _build_long_df(diag_dfs):
+    """Normalise diag_dfs to dict, filter converged, add model column."""
+    if isinstance(diag_dfs, pd.DataFrame):
+        diag_dfs = {"model": diag_dfs}
+    frames = []
+    for label, df in diag_dfs.items():
+        tmp = df[df["converged"] == True].copy()
+        tmp["model"] = label
+        frames.append(tmp)
+    return pd.concat(frames, ignore_index=True), list(diag_dfs.keys())
+
+
+def _infer_covariate_cols(long_df):
+    return [c.replace("resid_eta2_", "")
+            for c in long_df.columns if c.startswith("resid_eta2_")]
+
+
+def plot_diagnostics_population(diag_dfs, covariate_cols=None, alpha=0.05):
+    """
+    Two figures summarising population-level GLM diagnostics.
+
+    Figure 1 — timing & stationarity (panels A–C):
+      A : KS D distribution — overall spike-timing misfit
+      B : drift_auc — temporal non-stationarity
+      C : ks_z_autocorr — ISI serial correlation (spike history)
+
+    Figure 2 — covariate residual structure (panel D):
+      D  : η² violin per covariate × model
+      D2 : scatter η²_cov1 vs η²_cov2 per unit (2-covariate case only)
+
+    Parameters
+    ----------
+    diag_dfs       : DataFrame or dict {label: DataFrame}
+    covariate_cols : covariate names; inferred from column names if None
+    alpha          : KS CI threshold for reference line on Panel A
+    """
+    long_df, model_order = _build_long_df(diag_dfs)
+    n_models = len(model_order)
+    if covariate_cols is None:
+        covariate_cols = _infer_covariate_cols(long_df)
+    palette = sns.color_palette("tab10", n_models)
+
+    # ── Figure 1: timing & stationarity ──────────────────────────────────────
+    fig1, axes = plt.subplots(1, 3, figsize=(15, 5), constrained_layout=True)
+
+    ax = axes[0]
+    sns.violinplot(data=long_df, x="model", y="ks_D", order=model_order,
+                   palette=palette, inner="box", cut=0, ax=ax)
+    median_n = long_df["ks_D"].count() // n_models
+    ref_eps  = np.sqrt(-np.log(alpha / 2) / (2 * max(median_n, 1)))
+    ax.axhline(ref_eps, color="red", lw=1, ls="--", label=f"ε (n≈{median_n})")
+    ax.set_ylabel("KS D statistic"); ax.set_title("A  KS timing misfit")
+    ax.legend(fontsize=8); sns.despine(ax=ax)
+
+    ax = axes[1]
+    sns.violinplot(data=long_df, x="model", y="drift_auc", order=model_order,
+                   palette=palette, inner="box", cut=0, ax=ax)
+    ax.axhline(0, color="red", lw=1, ls="--")
+    ax.set_ylabel("drift AUC (norm.)"); ax.set_title("B  Temporal non-stationarity")
+    sns.despine(ax=ax)
+
+    ax = axes[2]
+    sns.violinplot(data=long_df, x="model", y="ks_z_autocorr", order=model_order,
+                   palette=palette, inner="box", cut=0, ax=ax)
+    ax.axhline(0, color="red", lw=1, ls="--", label="0 (no history)")
+    ax.set_ylabel("Spearman r(z_i, z_{i+1})")
+    ax.set_title("C  ISI autocorrelation (spike history)")
+    ax.legend(fontsize=8); sns.despine(ax=ax)
+
+    fig1.suptitle("Population diagnostics — timing & stationarity", fontsize=13)
+
+    # ── Figure 2: covariate residual structure ────────────────────────────────
+    eta2_cols = [f"resid_eta2_{c}" for c in covariate_cols]
+    melt_df   = long_df.melt(id_vars=["unit", "model"], value_vars=eta2_cols,
+                              var_name="covariate", value_name="eta2")
+    melt_df["covariate"] = melt_df["covariate"].str.replace("resid_eta2_", "",
+                                                             regex=False)
+
+    fig2, ax2 = plt.subplots(figsize=(6, 5), constrained_layout=True)
+    sns.violinplot(data=melt_df, x="covariate", y="eta2", hue="model",
+                   hue_order=model_order, palette=palette,
+                   inner="box", cut=0, ax=ax2)
+    ax2.axhline(0, color="red", lw=1, ls="--", label="η² = 0")
+    ax2.set_ylabel("η²  (residual variance explained by covariate)")
+    ax2.set_title("D  Covariate residual structure (η²)")
+    ax2.legend(fontsize=7, loc="upper right")
+    sns.despine(ax=ax2)
+    fig2.suptitle("Population diagnostics — covariate structure", fontsize=13)
+
+    # scatter: η²_cov1 vs η²_cov2, only when exactly 2 covariates
+    if len(covariate_cols) == 2:
+        fig3, ax3 = plt.subplots(figsize=(5, 5))
+        c0, c1 = eta2_cols
+        for label, color in zip(model_order, palette):
+            sub = long_df[long_df["model"] == label]
+            ax3.scatter(sub[c0], sub[c1], s=15, alpha=0.6,
+                        color=color, label=label)
+        ax3.axhline(0, color="grey", lw=0.8, ls="--")
+        ax3.axvline(0, color="grey", lw=0.8, ls="--")
+        ax3.set_xlabel(f"η²(residual, {covariate_cols[0]})")
+        ax3.set_ylabel(f"η²(residual, {covariate_cols[1]})")
+        ax3.set_title("D (scatter)  Co-occurrence of residual η²\n"
+                      "Diagonal = both failures in same unit → missing interaction")
+        ax3.legend(fontsize=8)
+        sns.despine(ax=ax3)
+        fig3.tight_layout()
+
+
+def compute_residual_profiles(formula, cov_df, spike_counts_masked, unit_ids,
+                               covariate_cols, base_dir, model_name, n_bins=50):
+    """Thin wrapper — calls compute_model_diagnostics and returns only profiles."""
+    _, profiles = compute_model_diagnostics(
+        formula, cov_df, spike_counts_masked, unit_ids,
+        covariate_cols, base_dir, model_name, n_bins=n_bins,
+    )
+    return profiles
+
+
+def plot_residual_profiles(profiles_dicts, covariate_cols=None):
+    """
+    Population-level mean residual profile per covariate, with model comparison.
+
+    One panel per covariate. For each model, shows the mean residual averaged
+    across all units as a function of covariate value, with an uncertainty band.
+    A flat line at zero = model captures that variable perfectly across the population.
+    Systematic peaks reveal where on the track / at what speed the model fails.
+
+    Parameters
+    ----------
+    profiles_dicts : dict {model_label: profiles_dict} or single profiles_dict
+                     (profiles_dict is the output of compute_residual_profiles)
+    covariate_cols : list of covariate names; inferred from keys if None
+    """
+    if not isinstance(profiles_dicts, dict) or "unit_ids" in profiles_dicts:
+        profiles_dicts = {"model": profiles_dicts}
+
+    if covariate_cols is None:
+        first = next(iter(profiles_dicts.values()))
+        covariate_cols = [k.replace("_profiles", "")
+                          for k in first if k.endswith("_profiles")]
+
+    model_order = list(profiles_dicts.keys())
+    palette     = sns.color_palette("tab10", len(model_order))
+    n_covs      = len(covariate_cols)
+
+    fig, axes = plt.subplots(1, n_covs, figsize=(6 * n_covs, 5),
+                             constrained_layout=True)
+    axes = np.atleast_1d(axes)
+
+    for k, col in enumerate(covariate_cols):
+        ax = axes[k]
+        ax.axhline(0, color="red", lw=1, ls="--", zorder=0)
+
+        for label, color in zip(model_order, palette):
+            prof  = profiles_dicts[label]
+            mat   = prof[f"{col}_profiles"]   # (n_units, n_bins)
+            cents = prof[f"{col}_centers"]    # (n_bins,)
+
+            if mat.shape[0] == 0:
+                continue
+            mean_prof = np.nanmean(mat, axis=0)
+            sem_prof  = np.nanstd(mat, axis=0) / np.sqrt(mat.shape[0])
+            ax.plot(cents, mean_prof, color=color, lw=1.5, label=label)
+            ax.fill_between(cents,
+                            mean_prof - sem_prof,
+                            mean_prof + sem_prof,
+                            color=color, alpha=0.25)
+
+        ax.set_xlabel(col)
+        ax.set_ylabel("Mean residual (spikes/bin)")
+        ax.set_title(f"Population residual profile\n{col}")
+        ax.legend(fontsize=8)
+        sns.despine(ax=ax)
+
+    fig.suptitle("Population mean residual profiles", fontsize=13)
+
+
+def plot_model_improvement(diag_dfs, reference, scalars=None):
+    """
+    Distribution of per-unit improvement (Δ) relative to a reference model.
+
+    For each non-reference model and each scalar, computes:
+        Δ = scalar_target − scalar_reference  (per unit, matched on unit ID)
+
+    Negative Δ = improvement over reference (lower is better for D, η², drift).
+    Positive Δ for ks_z_autocorr has no natural direction — shown for completeness.
+
+    One panel per scalar, one violin per target model. Zero line = no change.
+
+    Parameters
+    ----------
+    diag_dfs   : dict {model_label: DataFrame} — must include reference key
+    reference  : str, key of the reference model (e.g. "null_model_all")
+    scalars    : list of column names to compare; defaults to all diagnostic scalars
+    """
+    ref_df = diag_dfs[reference][diag_dfs[reference]["converged"] == True].set_index("unit")
+
+    if scalars is None:
+        scalars = (["ks_D", "drift_auc", "ks_z_autocorr"]
+                   + [c for c in ref_df.columns if c.startswith("resid_eta2_")])
+    scalars = [s for s in scalars if s in ref_df.columns]
+
+    target_labels = [k for k in diag_dfs if k != reference]
+    palette       = sns.color_palette("tab10", len(target_labels))
+
+    rows = []
+    for label in target_labels:
+        tgt = diag_dfs[label][diag_dfs[label]["converged"] == True].set_index("unit")
+        shared = ref_df.index.intersection(tgt.index)
+        for s in scalars:
+            if s not in tgt.columns:
+                continue
+            delta = tgt.loc[shared, s] - ref_df.loc[shared, s]
+            for uid, val in delta.items():
+                rows.append(dict(unit=uid, model=label, scalar=s, delta=val))
+
+    delta_df = pd.DataFrame(rows)
+    n_scalars = len(scalars)
+
+    fig, axes = plt.subplots(1, n_scalars,
+                             figsize=(4.5 * n_scalars, 5),
+                             constrained_layout=True)
+    axes = np.atleast_1d(axes)
+
+    for k, s in enumerate(scalars):
+        ax   = axes[k]
+        sub  = delta_df[delta_df["scalar"] == s]
+        sns.violinplot(data=sub, x="model", y="delta", order=target_labels,
+                       palette=palette, inner="box", cut=0, ax=ax)
+        ax.axhline(0, color="red", lw=1, ls="--", label="no change")
+        ax.set_ylabel(f"Δ {s}")
+        ax.set_title(s)
+        ax.set_xlabel("")
+        ax.tick_params(axis="x", rotation=20)
+        ax.legend(fontsize=7)
+        sns.despine(ax=ax)
+
+    fig.suptitle(f"Model improvement vs reference: {reference}", fontsize=13)
+
+
+# ── 5. Visualization ──────────────────────────────────────────────────────────
 # Shared state for plot functions — set via set_plot_state() after fitting
 
 _plot_state = {

@@ -203,11 +203,93 @@ def fit_and_save(name, formula, df, sc, path, keep_null=False):
 #     f"{base_dir}/analysis/choice_full_model_all.csv"
 # )
 
-fit_and_save(
-    "choice_temporal_model",
+# fit_and_save(
+#     "choice_temporal_model",
+#     f"spike_count ~ choice + cr(trial_progress, df={tp_df}, constraints='center') + bs(speed_scaled, df=4)",
+#     cov_df_out_common, spike_counts_out_common,
+#     f"{base_dir}/analysis/choice_temporal_model_all.csv"
+# )
+
+# print("\nAll models done.")
+
+
+# ── diagnostics ───────────────────────────────────────────────────────────────
+# Fits GLM once per unit and saves both scalar diagnostics (CSV) and residual
+# profiles (NPZ) in a single pass. Skips models where both files already exist.
+from encoding_utils import compute_model_diagnostics
+
+COVARIATE_COLS = ["linear_position", "speed"]
+
+def diag_and_save(model_name, formula, df, sc):
+    print(f"\nDiagnostics+profiles: {model_name} ({len(df):,} bins × {len(unit_ids)} units)...")
+    t0 = time.time()
+    result, _ = compute_model_diagnostics(
+        formula             = formula,
+        cov_df              = df,
+        spike_counts_masked = sc,
+        unit_ids            = unit_ids,
+        covariate_cols      = COVARIATE_COLS,
+        base_dir            = base_dir,
+        model_name          = model_name,
+    )
+    elapsed = time.time() - t0
+    n_ok = result["converged"].sum() if "converged" in result.columns else "?"
+    print(f"  Done in {elapsed:.0f}s — {n_ok}/{len(unit_ids)} converged")
+
+diag_and_save(
+    "null_model_all",
+    "spike_count ~ 1",
+    cov_df_common, spike_counts_common,
+)
+diag_and_save(
+    "null_model_out_all",
+    "spike_count ~ 1",
+    cov_df_out_common, spike_counts_out_common,
+)
+diag_and_save(
+    "trial_type_model_all",
+    "spike_count ~ trial_type",
+    cov_df_common, spike_counts_common,
+)
+diag_and_save(
+    "choice_model_all",
+    "spike_count ~ choice",
+    cov_df_out_common, spike_counts_out_common,
+)
+diag_and_save(
+    "speed_spline_model_all",
+    "spike_count ~ bs(speed_scaled, df=4)",
+    cov_df_common, spike_counts_common,
+)
+diag_and_save(
+    "pos_spline_model_all",
+    "spike_count ~ bs(pos_scaled, df=8)",
+    cov_df_common, spike_counts_common,
+)
+diag_and_save(
+    "trial_progress_spline_model_all",
+    f"spike_count ~ cr(trial_progress, df={tp_df}, constraints='center')",
+    cov_df_common, spike_counts_common,
+)
+diag_and_save(
+    "full_model_all",
+    "spike_count ~ trial_type + bs(pos_scaled, df=8) + bs(speed_scaled, df=4)",
+    cov_df_common, spike_counts_common,
+)
+diag_and_save(
+    "temporal_model_all",
+    f"spike_count ~ trial_type + cr(trial_progress, df={tp_df}, constraints='center') + bs(speed_scaled, df=4)",
+    cov_df_common, spike_counts_common,
+)
+diag_and_save(
+    "choice_full_model_all",
+    "spike_count ~ choice + bs(pos_scaled, df=8) + bs(speed_scaled, df=4)",
+    cov_df_out_common, spike_counts_out_common,
+)
+diag_and_save(
+    "choice_temporal_model_all",
     f"spike_count ~ choice + cr(trial_progress, df={tp_df}, constraints='center') + bs(speed_scaled, df=4)",
     cov_df_out_common, spike_counts_out_common,
-    f"{base_dir}/analysis/choice_temporal_model_all.csv"
 )
 
-print("\nAll models done.")
+print("\nAll diagnostics done.")
