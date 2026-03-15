@@ -22,7 +22,7 @@ import seaborn as sns
 import spyglass.linearization.v1 as sgpl
 from statsmodels.stats.multitest import multipletests
 import itertools
-
+sns.set_context("talk")
 
 
 # ── 1. Data preparation ───────────────────────────────────────────────────────
@@ -411,73 +411,149 @@ def compute_residuals(results, spike_counts, cov_df):
     return df
 
 
-def plot_residuals(residuals_df, covariate_cols, n_bins=50, title=""):
+def _load_trialized_position():
+    """Load trialized_position.csv once and cache at module level."""
+    if not hasattr(_load_trialized_position, "_cache"):
+        base = os.environ.get("SPYGLASS_BASE_DIR", ".")
+        path = os.path.join(base, "analysis", "position", "trialized_position.csv")
+        _load_trialized_position._cache = pd.read_csv(path, index_col="time",
+                                                       usecols=["time", "epoch"])
+    return _load_trialized_position._cache
+
+
+DEFAULT_PANELS = {
+    "linear_position": "continuous",
+    "speed":           "continuous",
+    "trial_progress":  "continuous",
+    "trial_type":      "categorical",
+    "choice":          "categorical",
+}
+
+
+def plot_residuals(residuals_df, n_bins=50, title="",
+                   show_cumulative=False, panels=None):
     """
     Diagnostic plots of model residuals.
 
-    Panel 1 — cumulative residual vs time:
-        The running sum of (observed - predicted) over bins. Under a well-specified
-        model this is a zero-mean random walk; a trend indicates slow drift
-        (arousal, electrode drift) that no covariate captures.
+    Panel 0 (optional) — cumulative residual vs time:
+        Running sum of (observed - predicted). A trend indicates temporal drift
+        not captured by any covariate.
 
-    Panels 2+ — mean raw residual vs each covariate:
-        Each panel bins one covariate and shows the average per-bin misfit.
-        A flat curve near zero indicates the model captures that covariate well;
-        systematic shape indicates unmodelled nonlinearity or missing interaction.
+    Continuous panels — CUSUM + binned mean residual vs covariate:
+        Systematic shape indicates unmodelled nonlinearity or a missing predictor.
+
+    Categorical panels — mean residual per category (± SEM):
+        A non-zero mean for one category indicates the model under/over-predicts
+        that condition and the categorical predictor should be added.
 
     Parameters
     ----------
-    residuals_df   : output of compute_residuals()
-    covariate_cols : list of column names in residuals_df to plot against
-    n_bins         : number of quantile bins for covariate plots
-    title          : overall figure suptitle
+    residuals_df    : output of compute_residuals()
+    n_bins          : number of bins for continuous covariate plots
+    title           : overall figure suptitle
+    show_cumulative : bool — include the cumulative residual vs time panel
+    panels          : dict {col: "continuous"|"categorical"}, optional.
+        Specifies which columns to plot and how. Defaults to DEFAULT_PANELS.
+        Columns absent from residuals_df or entirely NaN are silently skipped.
     """
-    n_panels = 1 + len(covariate_cols)
-    fig, axes = plt.subplots(1, n_panels, figsize=(5 * n_panels, 4))
-    axes = np.atleast_1d(axes)
+    if panels is None:
+        panels = DEFAULT_PANELS
 
-    # Panel 1: cumulative residual vs time
-    ax = axes[0]
-    ax.plot(residuals_df["cumulative_residual"].values, lw=0.6, color="steelblue")
-    ax.axhline(0, color="red", lw=1, ls="--")
-    ax.set_xlabel("Bin index (time)")
-    ax.set_ylabel("Cumulative residual (spikes)")
-    ax.set_title("Cumulative residual vs time")
-    sns.despine(ax=ax)
+    # Only keep panels whose column is present and has non-NaN data
+    active = {col: kind for col, kind in panels.items()
+              if col in residuals_df.columns and residuals_df[col].notna().any()}
 
-    # Panels 2+: mean raw residual binned by each covariate
-    for k, col in enumerate(covariate_cols):
-        ax = axes[1 + k]
-        valid = residuals_df[col].notna()
-        cov_vals = residuals_df.loc[valid, col].values
+    panel_size = 7
+    n_panels = len(active) + (1 if show_cumulative else 0)
+    ncols = int(np.ceil(np.sqrt(n_panels)))
+    nrows = int(np.ceil(n_panels / ncols))
+    fig, axes = plt.subplots(nrows, ncols,
+                             figsize=(panel_size * ncols, panel_size * nrows))
+    axes = np.atleast_1d(axes).flatten()
+    for ax in axes[n_panels:]:
+        ax.set_visible(False)
+
+    ax_idx = 0
+
+    # ── Optional: cumulative residual vs time (first epoch only) ─────────────
+    if show_cumulative:
+        ax = axes[ax_idx]; ax_idx += 1
+
+        tp = _load_trialized_position()
+        ep = tp["epoch"].dropna()
+        first_epoch_val = ep.iloc[0]
+        first_epoch_rows = tp.index[tp["epoch"] == first_epoch_val]
+        t_start, t_end = first_epoch_rows.min(), first_epoch_rows.max()
+
+        bin_times = residuals_df["time_bin_center"].values
+        epoch1_mask = (bin_times >= t_start) & (bin_times <= t_end)
+        epoch1_raw  = residuals_df.loc[epoch1_mask, "raw_residual"].values
+        epoch1_times_min = (bin_times[epoch1_mask] - t_start) / 60
+
+        cumresid = np.cumsum(epoch1_raw)
+        stride   = max(1, len(cumresid) // 5000)
+        ax.plot(epoch1_times_min[::stride], cumresid[::stride],
+                lw=0.6, color="steelblue", rasterized=True)
+        ax.axhline(0, color="red", lw=1, ls="--")
+
+        ax.set_xlabel("Time in epoch (min)")
+        ax.set_ylabel("Cumulative residual (spikes)")
+        ax.set_title(f"Cumulative residual — epoch {int(first_epoch_val)}")
+        sns.despine(ax=ax)
+
+    CUSUM_COLOR = "tomato"
+    RESID_COLOR = "steelblue"
+
+    for col, kind in active.items():
+        ax = axes[ax_idx]; ax_idx += 1
+        valid    = residuals_df[col].notna()
         res_vals = residuals_df.loc[valid, "raw_residual"].values
 
-        # Binned mean residual: average misfit at each covariate value
-        bins   = np.linspace(cov_vals.min(), cov_vals.max(), n_bins + 1)
-        idx    = np.digitize(cov_vals, bins) - 1
-        idx    = np.clip(idx, 0, n_bins - 1)
-        centers     = (bins[:-1] + bins[1:]) / 2
-        mean_resid  = np.array([res_vals[idx == b].mean() if (idx == b).any() else np.nan
-                                 for b in range(n_bins)])
+        if kind == "continuous":
+            cov_vals = residuals_df.loc[valid, col].values
 
-        # CUSUM: sort bins by covariate value, cumulative residual
-        sort_order  = np.argsort(cov_vals)
-        cusum       = np.cumsum(res_vals[sort_order])
-        x_cusum     = cov_vals[sort_order]
+            # Binned mean residual
+            bins       = np.linspace(cov_vals.min(), cov_vals.max(), n_bins + 1)
+            idx        = np.clip(np.digitize(cov_vals, bins) - 1, 0, n_bins - 1)
+            centers    = (bins[:-1] + bins[1:]) / 2
+            mean_resid = np.array([res_vals[idx == b].mean() if (idx == b).any()
+                                   else np.nan for b in range(n_bins)])
 
-        ax.plot(x_cusum, cusum, lw=0.8, color="tomato", alpha=0.7, label="CUSUM")
-        ax2 = ax.twinx()
-        ax2.bar(centers, mean_resid, width=(bins[1] - bins[0]) * 0.9,
-                color="steelblue", alpha=0.4, label="Mean residual")
-        ax2.axhline(0, color="black", lw=0.8, ls="--")
-        ax2.set_ylabel("Mean residual (spikes/bin)", fontsize=8)
+            # CUSUM sorted by covariate value
+            sort_order = np.argsort(cov_vals)
+            cusum      = np.cumsum(res_vals[sort_order])
+            x_cusum    = cov_vals[sort_order]
+
+            ax.plot(x_cusum, cusum, lw=0.8, color=CUSUM_COLOR, alpha=0.7)
+            ax.axhline(0, color=CUSUM_COLOR, lw=0.8, ls="--")
+            ax2 = ax.twinx()
+            ax2.bar(centers, mean_resid, width=(bins[1] - bins[0]) * 0.9,
+                    color=RESID_COLOR, alpha=0.4)
+            ax2.axhline(0, color=RESID_COLOR, lw=0.8, ls="--")
+
+            ax.set_ylabel("CUSUM (spikes)", color=CUSUM_COLOR)
+            ax.tick_params(axis="y", colors=CUSUM_COLOR)
+            ax.spines["left"].set_color(CUSUM_COLOR)
+            ax2.set_ylabel("Mean residual (spikes/bin)", color=RESID_COLOR)
+            ax2.tick_params(axis="y", colors=RESID_COLOR)
+            ax2.spines["right"].set_color(RESID_COLOR)
+
+        elif kind == "categorical":
+            cats      = sorted(residuals_df.loc[valid, col].unique())
+            cat_vals  = residuals_df.loc[valid, col].values
+            means     = np.array([res_vals[cat_vals == c].mean() for c in cats])
+            sems      = np.array([res_vals[cat_vals == c].std() /
+                                  np.sqrt((cat_vals == c).sum()) for c in cats])
+
+            ax.bar(cats, means, yerr=sems, color=RESID_COLOR, alpha=0.6,
+                   error_kw=dict(lw=1.2, capsize=4, capthick=1.2))
+            ax.axhline(0, color=RESID_COLOR, lw=0.8, ls="--")
+            ax.set_ylabel("Mean residual (spikes/bin)", color=RESID_COLOR)
+            ax.tick_params(axis="y", colors=RESID_COLOR)
+            ax.spines["left"].set_color(RESID_COLOR)
 
         ax.set_xlabel(col)
-        ax.set_ylabel("CUSUM (spikes)", fontsize=8)
         ax.set_title(f"Residual vs {col}")
-        lines1, labels1 = ax.get_legend_handles_labels()
-        lines2, labels2 = ax2.get_legend_handles_labels()
-        ax.legend(lines1 + lines2, labels1 + labels2, fontsize=7)
         sns.despine(ax=ax)
 
     if title:
@@ -534,7 +610,7 @@ def compute_ks_rescaled(results, spike_counts):
     return np.sort(_compute_z_unsorted(predicted, spike_counts))
 
 
-def plot_ks(z_vals, alpha=0.05, ax=None, title="KS plot (time-rescaling)"):
+def plot_ks(z_vals, alpha=0.05, ax=None, title = None):
     """
     KS plot: empirical CDF of rescaled ISIs vs Uniform(0,1) reference diagonal.
 
@@ -579,12 +655,15 @@ def plot_ks(z_vals, alpha=0.05, ax=None, title="KS plot (time-rescaling)"):
 
 
 def plot_diagnostics_batch(unit_list, formula, cov_df, spike_counts_masked, unit_ids,
-                           covariate_cols=None, n_bins=50, alpha=0.05):
+                           panels=None, n_bins=50, alpha=0.05, show_cumulative=False):
     """
     Fit GLM and run full diagnostics for a chosen list of units (max 5).
 
-    Produces one row per unit with columns:
-      [cumulative residual vs time] [mean residual vs cov1] ... [KS plot]
+    Produces one row per unit. Columns (left to right):
+      [optional: cumulative residual vs time] [residual panels...] [KS plot]
+
+    Continuous panels show binned mean residual vs covariate.
+    Categorical panels show mean residual ± SEM per category.
 
     Parameters
     ----------
@@ -593,12 +672,17 @@ def plot_diagnostics_batch(unit_list, formula, cov_df, spike_counts_masked, unit
     cov_df              : covariate DataFrame (n_bins rows, no spike_count column)
     spike_counts_masked : 2-D array (n_units × n_bins), observed spike counts
     unit_ids            : 1-D array of unit IDs, same order as spike_counts_masked rows
-    covariate_cols      : column names in cov_df to plot residuals against
-    n_bins              : number of bins for covariate residual panels
+    panels              : dict {col: "continuous"|"categorical"}, optional.
+        Defaults to DEFAULT_PANELS. Columns absent from cov_df are skipped.
+    n_bins              : number of bins for continuous covariate residual panels
     alpha               : CI level for KS confidence band (default 0.05)
+    show_cumulative     : bool — include cumulative residual vs time panel (default False)
     """
-    if covariate_cols is None:
-        covariate_cols = []
+    if panels is None:
+        panels = DEFAULT_PANELS
+
+    active = {col: kind for col, kind in panels.items()
+              if col in cov_df.columns and cov_df[col].notna().any()}
 
     if len(unit_list) > 5:
         print(f"unit_list has {len(unit_list)} entries — truncating to first 5")
@@ -606,18 +690,19 @@ def plot_diagnostics_batch(unit_list, formula, cov_df, spike_counts_masked, unit
 
     unit_ids_arr = np.asarray(unit_ids)
     n_rows = len(unit_list)
-    n_cols = 1 + len(covariate_cols) + 1   # time | covariates... | KS
+    n_cols = (1 if show_cumulative else 0) + len(active) + 1  # panels + KS
+
+    col_titles = (["Cumul. resid. vs time"] if show_cumulative else []) + \
+                 [f"Resid. vs {c}" for c in active] + ["KS"]
 
     fig, axes = plt.subplots(
         n_rows, n_cols,
-        figsize=(4.5 * n_cols, 3.5 * n_rows),
+        figsize=(5 * n_cols, 4.5 * n_rows),
         constrained_layout=True,
     )
     axes = np.array(axes).reshape(n_rows, n_cols)
 
-    col_titles = (["Cumul. resid. vs time"]
-                  + [f"Resid. vs {c}" for c in covariate_cols]
-                  + ["KS plot"])
+    RESID_COLOR = "steelblue"
 
     for row_idx, uid in enumerate(unit_list):
         matches = np.where(unit_ids_arr == uid)[0]
@@ -643,105 +728,128 @@ def plot_diagnostics_batch(unit_list, formula, cov_df, spike_counts_masked, unit
 
         predicted = np.asarray(res.predict())
         raw       = spike_counts_masked[i].astype(float) - predicted
-        cumresid  = np.cumsum(raw)
 
-        # ── Panel 0: cumulative residual vs time ──────────────────────────────
-        ax = axes[row_idx, 0]
-        ax.plot(cumresid, lw=0.6, color="steelblue")
-        ax.axhline(0, color="red", lw=1, ls="--")
-        ax.set_xlabel("Bin index (time)", fontsize=8)
-        ax.set_ylabel(f"unit {uid}\ncumul. resid.", fontsize=8)
-        ax.tick_params(labelsize=7)
-        sns.despine(ax=ax)
+        col_idx = 0
 
-        # ── Panels 1..N: mean raw residual vs each covariate ─────────────────
-        for k, col in enumerate(covariate_cols):
-            ax = axes[row_idx, 1 + k]
-            valid    = ~np.isnan(cov_df[col].values)
-            cov_vals = cov_df[col].values[valid]
-            res_vals = raw[valid]
-
-            bins        = np.linspace(cov_vals.min(), cov_vals.max(), n_bins + 1)
-            bin_idx     = np.clip(np.digitize(cov_vals, bins) - 1, 0, n_bins - 1)
-            centers     = (bins[:-1] + bins[1:]) / 2
-            mean_resid  = np.array([
-                res_vals[bin_idx == b].mean() if (bin_idx == b).any() else np.nan
-                for b in range(n_bins)
-            ])
-
-            ax.plot(centers, mean_resid, lw=1.2, color="steelblue")
+        # ── Optional: cumulative residual vs time ─────────────────────────────
+        if show_cumulative:
+            ax = axes[row_idx, col_idx]; col_idx += 1
+            cumresid = np.cumsum(raw)
+            stride   = max(1, len(cumresid) // 5000)
+            ax.plot(np.arange(0, len(cumresid), stride), cumresid[::stride],
+                    lw=0.6, color=RESID_COLOR, rasterized=True)
             ax.axhline(0, color="red", lw=1, ls="--")
-            ax.set_xlabel(col, fontsize=8)
-            ax.set_ylabel("Mean resid.\n(spikes/bin)", fontsize=8)
+            ax.set_xlabel("Time", fontsize=8)
+            ax.set_ylabel(f"unit {uid}\ncumul. resid.", fontsize=8)
             ax.tick_params(labelsize=7)
             sns.despine(ax=ax)
 
-        # Equalise y-axis limits across all covariate panels for this unit
-        # so magnitudes are directly comparable across covariates
-        if len(covariate_cols) > 1:
-            cov_axes  = [axes[row_idx, 1 + k] for k in range(len(covariate_cols))]
-            max_abs   = max(max(abs(y) for y in ax.get_ylim()) for ax in cov_axes)
-            for ax in cov_axes:
+        # ── Covariate panels ──────────────────────────────────────────────────
+        cont_ax_indices = []
+        for col, kind in active.items():
+            ax = axes[row_idx, col_idx]; col_idx += 1
+            valid    = cov_df[col].notna().values
+            res_vals = raw[valid]
+
+            if kind == "continuous":
+                cov_vals   = cov_df[col].values[valid]
+                bins       = np.linspace(cov_vals.min(), cov_vals.max(), n_bins + 1)
+                bin_idx    = np.clip(np.digitize(cov_vals, bins) - 1, 0, n_bins - 1)
+                centers    = (bins[:-1] + bins[1:]) / 2
+                mean_resid = np.array([res_vals[bin_idx == b].mean()
+                                       if (bin_idx == b).any() else np.nan
+                                       for b in range(n_bins)])
+                ax.plot(centers, mean_resid, lw=1.2, color=RESID_COLOR)
+                ax.axhline(0, color=RESID_COLOR, lw=0.8, ls="--")
+                ax.set_ylabel("Mean resid.\n(spikes/bin)", fontsize=8, color=RESID_COLOR)
+                cont_ax_indices.append(col_idx - 1)
+
+            elif kind == "categorical":
+                cat_vals = cov_df[col].values[valid]
+                cats     = sorted(set(cat_vals[~pd.isnull(cat_vals)]))
+                means    = np.array([res_vals[cat_vals == c].mean() for c in cats])
+                sems     = np.array([res_vals[cat_vals == c].std() /
+                                     np.sqrt((cat_vals == c).sum()) for c in cats])
+                ax.bar(cats, means, yerr=sems, color=RESID_COLOR, alpha=0.6,
+                       error_kw=dict(lw=1.2, capsize=4, capthick=1.2))
+                ax.axhline(0, color=RESID_COLOR, lw=0.8, ls="--")
+                ax.set_ylabel("Mean resid.\n(spikes/bin)", fontsize=8, color=RESID_COLOR)
+
+            ax.set_xlabel(col, fontsize=8)
+            ax.tick_params(labelsize=7)
+            ax.tick_params(axis="y", colors=RESID_COLOR)
+            ax.spines["left"].set_color(RESID_COLOR)
+            sns.despine(ax=ax)
+
+        # Equalise y-limits across continuous panels
+        if len(cont_ax_indices) > 1:
+            cont_axes = [axes[row_idx, j] for j in cont_ax_indices]
+            max_abs   = max(max(abs(y) for y in ax.get_ylim()) for ax in cont_axes)
+            for ax in cont_axes:
                 ax.set_ylim(-max_abs, max_abs)
 
-        # ── Last panel: KS plot ───────────────────────────────────────────────
-        ax   = axes[row_idx, -1]
-        z    = compute_ks_rescaled(res, spike_counts_masked[i])
-        n    = len(z)
+        # ── KS panel ─────────────────────────────────────────────────────────
+        ax = axes[row_idx, col_idx]
+        z  = compute_ks_rescaled(res, spike_counts_masked[i])
+        n  = len(z)
         if n > 0:
             ecdf    = np.arange(1, n + 1) / n
             epsilon = np.sqrt(-np.log(alpha / 2) / (2 * n))
             ax.fill_between(z, np.clip(ecdf - epsilon, 0, 1),
                             np.clip(ecdf + epsilon, 0, 1),
-                            alpha=0.2, color="steelblue")
-            ax.plot(z, ecdf, color="steelblue", lw=1.5)
+                            alpha=0.2, color=RESID_COLOR)
+            ax.plot(z, ecdf, color=RESID_COLOR, lw=1.5)
             ax.plot([0, 1], [0, 1], "k--", lw=1)
-
-            D = np.max(np.abs(ecdf - z))
+            D      = np.max(np.abs(ecdf - z))
             passed = D <= epsilon
-            label  = "pass" if passed else "FAIL"
-            color  = "green" if passed else "red"
-            ax.text(0.05, 0.90, f"D = {D:.3f}  {label}",
+            ax.text(0.05, 0.90, f"D={D:.3f} {'pass' if passed else 'FAIL'}",
                     transform=ax.transAxes, fontsize=8,
-                    color=color, fontweight="bold")
-
+                    color="green" if passed else "red", fontweight="bold")
         ax.set_xlabel("z (rescaled ISI)", fontsize=8)
         ax.set_ylabel("Empirical CDF", fontsize=8)
         ax.tick_params(labelsize=7)
         sns.despine(ax=ax)
 
+        # Unit label on leftmost panel
+        axes[row_idx, 0].set_ylabel(f"unit {uid}\n" +
+                                    axes[row_idx, 0].get_ylabel(), fontsize=8)
+
     # Column titles on first row only
-    for col_idx, title in enumerate(col_titles):
-        axes[0, col_idx].set_title(title, fontsize=9, fontweight="bold")
+    for j, t in enumerate(col_titles):
+        axes[0, j].set_title(t, fontsize=9, fontweight="bold")
 
     fig.suptitle("GLM diagnostics — selected units", fontsize=12)
 
 
-def plot_diagnostics(results, spike_counts, cov_df, covariate_cols,
-                     n_bins=50, unit_label="", alpha=0.05):
+def plot_diagnostics(results, spike_counts, cov_df,
+                     n_bins=50, unit_label="", alpha=0.05,
+                     panels=None, show_cumulative=False):
     """
     Full diagnostic dashboard for one unit's fitted Poisson GLM.
 
-    Calls compute_residuals → plot_residuals (cumulative + covariate panels),
+    Calls compute_residuals → plot_residuals (covariate panels),
     then compute_ks_rescaled → plot_ks in a separate figure.
 
     Parameters
     ----------
-    results        : fitted statsmodels GLM result
-    spike_counts   : 1-D array (n_bins,) for this unit
-    cov_df         : covariate DataFrame (n_bins rows)
-    covariate_cols : list of column names to show residuals against
-    n_bins         : bins for covariate residual plots
-    unit_label     : string identifier shown in plot titles
-    alpha          : CI level for KS bands (default 0.05)
+    results         : fitted statsmodels GLM result
+    spike_counts    : 1-D array (n_bins,) for this unit
+    cov_df          : covariate DataFrame (n_bins rows)
+    n_bins          : bins for continuous covariate residual plots
+    unit_label      : string identifier shown in plot titles
+    alpha           : CI level for KS bands (default 0.05)
+    panels          : dict {col: "continuous"|"categorical"}, optional.
+        Forwarded to plot_residuals. Defaults to DEFAULT_PANELS.
+    show_cumulative : bool — include the cumulative residual vs time panel.
     """
     residuals_df = compute_residuals(results, spike_counts, cov_df)
-    plot_residuals(residuals_df, covariate_cols, n_bins=n_bins,
-                   title=f"Residuals — {unit_label}")
+    plot_residuals(residuals_df, n_bins=n_bins,
+                   title=f"Residuals — {unit_label}",
+                   panels=panels, show_cumulative=show_cumulative)
 
     z_vals = compute_ks_rescaled(results, spike_counts)
     fig, ax = plt.subplots(figsize=(5, 5))
-    plot_ks(z_vals, alpha=alpha, ax=ax, title=f"KS — {unit_label}")
+    plot_ks(z_vals, alpha=alpha, ax=ax, title=f"KS — {unit_label}",)
     plt.tight_layout()
 
 
@@ -1015,6 +1123,85 @@ def compute_residual_profiles(formula, cov_df, spike_counts_masked, unit_ids,
         covariate_cols, base_dir, model_name, n_bins=n_bins,
     )
     return profiles
+
+
+def plot_residual_heterogeneity(profiles):
+    """
+    Population-level residual heterogeneity summary. One row per covariate:
+
+    Left — heatmap (units × covariate bins), color = mean residual (spikes/bin).
+        Units sorted by the position of their peak absolute residual so
+        spatially-tuned units cluster visually.
+
+    Right — violin of mean |residual| per unit across the population.
+        Each unit contributes one scalar = mean of |bar heights| from its
+        individual residuals plot. The violin shows the full distribution
+        without collapsing heterogeneity.
+
+    Parameters
+    ----------
+    profiles : dict, output of compute_model_diagnostics or compute_residual_profiles.
+        Expected keys: "{col}_profiles" (n_units × n_bins), "{col}_centers".
+    """
+    cols = [k.replace("_profiles", "") for k in profiles if k.endswith("_profiles")]
+    if not cols:
+        raise ValueError("No profile arrays found in profiles dict.")
+
+    n_covs = len(cols)
+    fig, axes = plt.subplots(n_covs, 2, figsize=(16, 5 * n_covs))
+    axes = np.atleast_2d(axes)
+
+    for row, col in enumerate(cols):
+        mat     = np.array(profiles[f"{col}_profiles"])   # (n_units, n_bins)
+        centers = np.array(profiles[f"{col}_centers"])
+
+        # Row-normalise: divide each unit's profile by its own max |residual|
+        # so the heatmap shows SHAPE across units, not magnitude.
+        # Units with all-NaN or zero profile are left as NaN.
+        row_max = np.nanmax(np.abs(mat), axis=1, keepdims=True)
+        row_max[row_max == 0] = np.nan
+        mat_norm = mat / row_max
+
+        # Sort units by position of peak absolute residual
+        peak_idx   = np.nanargmax(np.abs(mat_norm), axis=1)
+        sort_order = np.argsort(peak_idx)
+
+        # ── Heatmap (row-normalised) ──────────────────────────────────────────
+        ax = axes[row, 0]
+        im = ax.imshow(
+            mat_norm[sort_order], aspect="auto", cmap="RdBu_r",
+            vmin=-1, vmax=1,
+            extent=[centers[0], centers[-1], mat.shape[0], 0],
+            interpolation="nearest",
+        )
+        plt.colorbar(im, ax=ax, label="Normalised residual (a.u.)", shrink=0.8)
+        ax.set_xlabel(col)
+        ax.set_ylabel("Unit (sorted by peak)")
+        ax.set_title(f"Residual profiles — {col}\n(row-normalised)")
+        sns.despine(ax=ax)
+
+        # ── Strip plot ────────────────────────────────────────────────────────
+        ax = axes[row, 1]
+        mean_abs = np.nanmean(np.abs(mat), axis=1)
+        mean_abs = mean_abs[~np.isnan(mean_abs)]
+
+        rng = np.random.default_rng(0)
+        jitter = rng.uniform(-0.15, 0.15, size=len(mean_abs))
+        ax.scatter(jitter, mean_abs, s=6, alpha=0.4, color="steelblue",
+                   linewidths=0, rasterized=True)
+        ax.axhline(0, color="gray", lw=1, ls="--")
+        ax.axhline(np.median(mean_abs), color="tomato", lw=1.5, ls="--",
+                   label=f"median={np.median(mean_abs):.5f}")
+        ax.set_ylim(0, 0.005)
+        ax.set_xlim(-0.5, 0.5)
+        ax.set_xticks([0]); ax.set_xticklabels([col])
+        ax.set_ylabel("Mean |residual| (spikes/bin)")
+        ax.set_title(f"Distribution across units — {col}")
+        ax.legend(fontsize=8)
+        sns.despine(ax=ax)
+
+    plt.tight_layout()
+    return fig
 
 
 def plot_residual_profiles(profiles_dicts, covariate_cols=None):
