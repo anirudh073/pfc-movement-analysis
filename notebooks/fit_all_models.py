@@ -48,7 +48,7 @@ def interp_col(col_values, times, bin_centers):
         # Exclude NaN anchor points — np.interp propagates NaN from any bracketing point
         return np.interp(bin_centers, times[valid], vals[valid], left=np.nan, right=np.nan)
     else:
-        idx = np.searchsorted(times, bin_centers).clip(0, len(times) - 1)
+        idx = (np.searchsorted(times, bin_centers, side='right') - 1).clip(0, len(times) - 1)
         return col_values.iloc[idx].values
 
 cols_to_interp = [c for c in trialized_position.columns if c != "video_frame_ind"]
@@ -157,23 +157,18 @@ def fit_and_save(name, formula, df, sc, path, keep_null=False):
 #     f"{base_dir}/analysis/choice_model_all.csv"
 # )
 
-# fit_and_save(
-#     "speed", "spike_count ~ speed",
-#     cov_df_common, spike_counts_common,
-#     f"{base_dir}/analysis/speed_model_all.csv"
-# )
 
-# fit_and_save(
-#     "speed_spline", f"spike_count ~ bs(speed_scaled, df=4)",
-#     cov_df_common, spike_counts_common,
-#     f"{base_dir}/analysis/speed_spline_model_all.csv"
-# )
+fit_and_save(
+    "speed_spline", f"spike_count ~ bs(speed_scaled, df=4)",
+    cov_df_common, spike_counts_common,
+    f"{base_dir}/analysis/speed_spline_model_all.csv"
+)
 
-# fit_and_save(
-#     "pos_spline", "spike_count ~ bs(pos_scaled, df=8)",
-#     cov_df_common, spike_counts_common,
-#     f"{base_dir}/analysis/pos_spline_model_all.csv"
-# )
+fit_and_save(
+    "pos_spline", "spike_count ~ bs(pos_scaled, df=8)",
+    cov_df_common, spike_counts_common,
+    f"{base_dir}/analysis/pos_spline_model_all.csv"
+)
 
 # fit_and_save(
 #     "trial_progress_spline", f"spike_count ~ cr(trial_progress, df={tp_df}, constraints='center')",
@@ -181,20 +176,20 @@ def fit_and_save(name, formula, df, sc, path, keep_null=False):
 #     f"{base_dir}/analysis/trial_progress_spline_model_all.csv"
 # )
 
-# ── multi-variable models ──────────────────────────────────────────────────────
-# fit_and_save(
-#     "full_model",
-#     "spike_count ~ trial_type + bs(pos_scaled, df=8) + bs(speed_scaled, df=4)",
-#     cov_df_common, spike_counts_common,
-#     f"{base_dir}/analysis/full_model_all.csv"
-# )
+# # ── multi-variable models ──────────────────────────────────────────────────────
+fit_and_save(
+    "full_model",
+    "spike_count ~ trial_type + bs(pos_scaled, df=8) + bs(speed_scaled, df=4)",
+    cov_df_common, spike_counts_common,
+    f"{base_dir}/analysis/full_model_all.csv"
+)
 
-# fit_and_save(
-#     "temporal_model",
-#     f"spike_count ~ trial_type + cr(trial_progress, df={tp_df}, constraints='center') + bs(speed_scaled, df=4)",
-#     cov_df_common, spike_counts_common,
-#     f"{base_dir}/analysis/temporal_model_all.csv"
-# )
+fit_and_save(
+    "temporal_model",
+    f"spike_count ~ trial_type + cr(trial_progress, df={tp_df}, constraints='center') + bs(speed_scaled, df=4)",
+    cov_df_common, spike_counts_common,
+    f"{base_dir}/analysis/temporal_model_all.csv"
+)
 
 # fit_and_save(
 #     "choice_full_model",
@@ -210,7 +205,7 @@ def fit_and_save(name, formula, df, sc, path, keep_null=False):
 #     f"{base_dir}/analysis/choice_temporal_model_all.csv"
 # )
 
-# print("\nAll models done.")
+print("\nAll models done.")
 
 
 # ── diagnostics ───────────────────────────────────────────────────────────────
@@ -218,7 +213,8 @@ def fit_and_save(name, formula, df, sc, path, keep_null=False):
 # profiles (NPZ) in a single pass. Skips models where both files already exist.
 from encoding_utils import compute_model_diagnostics
 
-COVARIATE_COLS = ["linear_position", "speed"]
+COVARIATE_COLS   = ["linear_position", "speed", "trial_progress"]
+CATEGORICAL_COLS = ["trial_type", "choice"]
 
 def diag_and_save(model_name, formula, df, sc):
     print(f"\nDiagnostics+profiles: {model_name} ({len(df):,} bins × {len(unit_ids)} units)...")
@@ -229,6 +225,7 @@ def diag_and_save(model_name, formula, df, sc):
         spike_counts_masked = sc,
         unit_ids            = unit_ids,
         covariate_cols      = COVARIATE_COLS,
+        categorical_cols    = CATEGORICAL_COLS,
         base_dir            = base_dir,
         model_name          = model_name,
     )
@@ -236,26 +233,26 @@ def diag_and_save(model_name, formula, df, sc):
     n_ok = result["converged"].sum() if "converged" in result.columns else "?"
     print(f"  Done in {elapsed:.0f}s — {n_ok}/{len(unit_ids)} converged")
 
-diag_and_save(
-    "null_model_all",
-    "spike_count ~ 1",
-    cov_df_common, spike_counts_common,
-)
-diag_and_save(
-    "null_model_out_all",
-    "spike_count ~ 1",
-    cov_df_out_common, spike_counts_out_common,
-)
-diag_and_save(
-    "trial_type_model_all",
-    "spike_count ~ trial_type",
-    cov_df_common, spike_counts_common,
-)
-diag_and_save(
-    "choice_model_all",
-    "spike_count ~ choice",
-    cov_df_out_common, spike_counts_out_common,
-)
+# diag_and_save(
+#     "null_model_all",
+#     "spike_count ~ 1",
+#     cov_df_common, spike_counts_common,
+# )
+# diag_and_save(
+#     "null_model_out_all",
+#     "spike_count ~ 1",
+#     cov_df_out_common, spike_counts_out_common,
+# )
+# diag_and_save(
+#     "trial_type_model_all",
+#     "spike_count ~ trial_type",
+#     cov_df_common, spike_counts_common,
+# )
+# diag_and_save(
+#     "choice_model_all",
+#     "spike_count ~ choice",
+#     cov_df_out_common, spike_counts_out_common,
+# )
 diag_and_save(
     "speed_spline_model_all",
     "spike_count ~ bs(speed_scaled, df=4)",
@@ -266,11 +263,11 @@ diag_and_save(
     "spike_count ~ bs(pos_scaled, df=8)",
     cov_df_common, spike_counts_common,
 )
-diag_and_save(
-    "trial_progress_spline_model_all",
-    f"spike_count ~ cr(trial_progress, df={tp_df}, constraints='center')",
-    cov_df_common, spike_counts_common,
-)
+# diag_and_save(
+#     "trial_progress_spline_model_all",
+#     f"spike_count ~ cr(trial_progress, df={tp_df}, constraints='center')",
+#     cov_df_common, spike_counts_common,
+# )
 diag_and_save(
     "full_model_all",
     "spike_count ~ trial_type + bs(pos_scaled, df=8) + bs(speed_scaled, df=4)",
@@ -281,15 +278,15 @@ diag_and_save(
     f"spike_count ~ trial_type + cr(trial_progress, df={tp_df}, constraints='center') + bs(speed_scaled, df=4)",
     cov_df_common, spike_counts_common,
 )
-diag_and_save(
-    "choice_full_model_all",
-    "spike_count ~ choice + bs(pos_scaled, df=8) + bs(speed_scaled, df=4)",
-    cov_df_out_common, spike_counts_out_common,
-)
-diag_and_save(
-    "choice_temporal_model_all",
-    f"spike_count ~ choice + cr(trial_progress, df={tp_df}, constraints='center') + bs(speed_scaled, df=4)",
-    cov_df_out_common, spike_counts_out_common,
-)
+# diag_and_save(
+#     "choice_full_model_all",
+#     "spike_count ~ choice + bs(pos_scaled, df=8) + bs(speed_scaled, df=4)",
+#     cov_df_out_common, spike_counts_out_common,
+# )
+# diag_and_save(
+#     "choice_temporal_model_all",
+#     f"spike_count ~ choice + cr(trial_progress, df={tp_df}, constraints='center') + bs(speed_scaled, df=4)",
+#     cov_df_out_common, spike_counts_out_common,
+# )
 
 print("\nAll diagnostics done.")

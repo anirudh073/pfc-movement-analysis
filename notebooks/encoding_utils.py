@@ -36,7 +36,8 @@ def interp_col(col_values, times, bin_centers):
         # Exclude NaN anchor points — np.interp propagates NaN from any bracketing point
         return np.interp(bin_centers, times[valid], vals[valid], left=np.nan, right=np.nan)
     else:
-        idx = np.searchsorted(times, bin_centers).clip(0, len(times) - 1)
+        # ffill: use the last timestamp <= bin_center (right-1), not the next one
+        idx = (np.searchsorted(times, bin_centers, side='right') - 1).clip(0, len(times) - 1)
         return col_values.iloc[idx].values
 
 
@@ -161,22 +162,22 @@ def make_drop_one_specs(cov_df_common, spike_counts_common,
             "spike_counts": spike_counts_common,
             "null_csv": f"{base_dir}/analysis/null_model_all.csv",
         },
-        "choice_full_model_all": {
-            "formula_lhs": "spike_count",
-            "terms": ["choice", pos, spd],
-            "delta_df": {"choice": 1, pos: pos_df, spd: speed_df},
-            "cov_df": cov_df_out_common,
-            "spike_counts": spike_counts_out_common,
-            "null_csv": f"{base_dir}/analysis/null_model_out_all.csv",
-        },
-        "choice_temporal_model_all": {
-            "formula_lhs": "spike_count",
-            "terms": ["choice", tp, spd],
-            "delta_df": {"choice": 1, tp: tp_df, spd: speed_df},
-            "cov_df": cov_df_out_common,
-            "spike_counts": spike_counts_out_common,
-            "null_csv": f"{base_dir}/analysis/null_model_out_all.csv",
-        },
+        # "choice_full_model_all": {
+        #     "formula_lhs": "spike_count",
+        #     "terms": ["choice", pos, spd],
+        #     "delta_df": {"choice": 1, pos: pos_df, spd: speed_df},
+        #     "cov_df": cov_df_out_common,
+        #     "spike_counts": spike_counts_out_common,
+        #     "null_csv": f"{base_dir}/analysis/null_model_out_all.csv",
+        # },
+        # "choice_temporal_model_all": {
+        #     "formula_lhs": "spike_count",
+        #     "terms": ["choice", tp, spd],
+        #     "delta_df": {"choice": 1, tp: tp_df, spd: speed_df},
+        #     "cov_df": cov_df_out_common,
+        #     "spike_counts": spike_counts_out_common,
+        #     "null_csv": f"{base_dir}/analysis/null_model_out_all.csv",
+        # },
     }
 
 
@@ -294,9 +295,12 @@ def pairwise_term_comparison(drop_one_results: pd.DataFrame,
 TERM_LABELS = {
     "trial_type": "trial_type",
     "choice":     "choice",
-    "bs(pos_scaled, df = 8)":                             "position",
-    "bs(speed_scaled, df = 4)":                           "speed",
-    "cr(trial_progress, df = 6, constraints = 'center')": "trial_progress",
+    "bs(pos_scaled, df = 8)":  "position",
+    "bs(speed_scaled, df = 4)": "speed",
+}
+
+EXCLUDE_TERMS = {
+    "cr(trial_progress, df = 6, constraints = 'center')",
 }
 
 
@@ -315,7 +319,7 @@ def plot_drop_one_summary(drop_one_results, pairwise_pvals=None,
     if term_labels is None:
         term_labels = TERM_LABELS
 
-    df = drop_one_results.copy()
+    df = drop_one_results[~drop_one_results["dropped_term"].isin(EXCLUDE_TERMS)].copy()
     df["term_label"] = df["dropped_term"].map(term_labels).fillna(df["dropped_term"])
 
     term_order = (df.groupby("term_label")["partial_r2"]
@@ -855,7 +859,7 @@ def plot_diagnostics(results, spike_counts, cov_df,
 
 def compute_model_diagnostics(formula, cov_df, spike_counts_masked, unit_ids,
                                covariate_cols, base_dir, model_name,
-                               n_bins=50, unit_subset=None):
+                               n_bins=50, unit_subset=None, categorical_cols=None):
     """
     Fit GLM once per unit and compute both scalar diagnostics and residual profiles.
 
@@ -903,8 +907,17 @@ def compute_model_diagnostics(formula, cov_df, spike_counts_masked, unit_ids,
         bin_edges[col]   = edges
         bin_centers[col] = (edges[:-1] + edges[1:]) / 2
 
+    categorical_cols = categorical_cols or []
+    # pre-compute category labels per categorical col
+    cat_labels = {}
+    for col in categorical_cols:
+        if col in cov_df.columns:
+            vals = cov_df[col].dropna().unique()
+            cat_labels[col] = sorted(vals)
+
     diag_rows      = []
     profile_rows   = {col: [] for col in covariate_cols}
+    cat_profile_rows = {col: [] for col in categorical_cols if col in cov_df.columns}
     valid_prof_ids = []
 
     for count, i in enumerate(indices):
@@ -975,6 +988,17 @@ def compute_model_diagnostics(formula, cov_df, spike_counts_masked, unit_ids,
                 for b in range(n_bins)
             ])
             profile_rows[col].append(means)
+        # ── categorical profiles ──────────────────────────────────────────────
+        for col in categorical_cols:
+            if col not in cov_df.columns:
+                continue
+            cat_vals = cov_df[col].values
+            means = np.array([
+                raw[cat_vals == c].mean() if (cat_vals == c).any() else np.nan
+                for c in cat_labels[col]
+            ])
+            cat_profile_rows[col].append(means)
+
         valid_prof_ids.append(uid)
 
         if (count + 1) % 50 == 0:
@@ -985,6 +1009,10 @@ def compute_model_diagnostics(formula, cov_df, spike_counts_masked, unit_ids,
     for col in covariate_cols:
         profiles[f"{col}_profiles"] = np.array(profile_rows[col])
         profiles[f"{col}_centers"]  = bin_centers[col]
+    for col in categorical_cols:
+        if col in cat_profile_rows:
+            profiles[f"{col}_cat_profiles"] = np.array(cat_profile_rows[col])
+            profiles[f"{col}_cat_labels"]   = np.array(cat_labels[col], dtype=object)
 
     if unit_subset is None:
         diag_df.to_csv(csv_path)
@@ -1125,79 +1153,89 @@ def compute_residual_profiles(formula, cov_df, spike_counts_masked, unit_ids,
     return profiles
 
 
-def plot_residual_heterogeneity(profiles):
+def plot_residual_heterogeneity(profiles, panels=None, row_normalise=True):
     """
-    Population-level residual heterogeneity summary. One row per covariate:
-
-    Left — heatmap (units × covariate bins), color = mean residual (spikes/bin).
-        Units sorted by the position of their peak absolute residual so
-        spatially-tuned units cluster visually.
-
-    Right — violin of mean |residual| per unit across the population.
-        Each unit contributes one scalar = mean of |bar heights| from its
-        individual residuals plot. The violin shows the full distribution
-        without collapsing heterogeneity.
+    Population-level residual heterogeneity: one heatmap per covariate.
 
     Parameters
     ----------
-    profiles : dict, output of compute_model_diagnostics or compute_residual_profiles.
-        Expected keys: "{col}_profiles" (n_units × n_bins), "{col}_centers".
+    profiles      : dict from compute_model_diagnostics.
+    panels        : dict {col: "continuous"|"categorical"}, optional.
+                    Defaults to all panels detected in profiles.
+    row_normalise : bool (default True). If True, each row is divided by its
+                    max absolute value so all neurons share the same ±1 scale
+                    (useful for comparing structure across neurons). If False,
+                    raw residuals in spikes/bin are shown with a shared colorscale
+                    (useful for comparing magnitude across models).
     """
-    cols = [k.replace("_profiles", "") for k in profiles if k.endswith("_profiles")]
-    if not cols:
-        raise ValueError("No profile arrays found in profiles dict.")
+    if panels is None:
+        panels = {}
+        for k in profiles:
+            if k.endswith("_cat_profiles"):
+                panels[k.replace("_cat_profiles", "")] = "categorical"
+            elif k.endswith("_profiles"):
+                panels[k.replace("_profiles", "")] = "continuous"
 
-    n_covs = len(cols)
-    fig, axes = plt.subplots(n_covs, 2, figsize=(16, 5 * n_covs))
-    axes = np.atleast_2d(axes)
+    panels = {col: kind for col, kind in panels.items()
+              if (kind == "continuous" and f"{col}_profiles" in profiles)
+              or (kind == "categorical" and f"{col}_cat_profiles" in profiles)}
 
-    for row, col in enumerate(cols):
-        mat     = np.array(profiles[f"{col}_profiles"])   # (n_units, n_bins)
-        centers = np.array(profiles[f"{col}_centers"])
+    if not panels:
+        raise ValueError("No matching panels found in profiles dict.")
 
-        # Row-normalise: divide each unit's profile by its own max |residual|
-        # so the heatmap shows SHAPE across units, not magnitude.
-        # Units with all-NaN or zero profile are left as NaN.
-        row_max = np.nanmax(np.abs(mat), axis=1, keepdims=True)
-        row_max[row_max == 0] = np.nan
-        mat_norm = mat / row_max
+    n = len(panels)
+    fig, axes = plt.subplots(1, n, figsize=(5 * n, 8))
+    axes = np.atleast_1d(axes)
 
-        # Sort units by position of peak absolute residual
-        peak_idx   = np.nanargmax(np.abs(mat_norm), axis=1)
-        sort_order = np.argsort(peak_idx)
+    for ax, (col, kind) in zip(axes, panels.items()):
+        if kind == "continuous":
+            mat     = np.array(profiles[f"{col}_profiles"])
+            centers = np.array(profiles[f"{col}_centers"])
+            if row_normalise:
+                row_max = np.nanmax(np.abs(mat), axis=1, keepdims=True)
+                row_max[row_max == 0] = np.nan
+                mat_plot = mat / row_max
+                vmin, vmax = -1, 1
+            else:
+                mat_plot = mat
+                absmax = np.nanmax(np.abs(mat))
+                vmin, vmax = -absmax, absmax
+            sort_order = np.argsort(np.nanargmax(np.abs(mat_plot), axis=1))
+            im = ax.imshow(
+                mat_plot[sort_order], aspect="auto", cmap="RdBu_r",
+                vmin=vmin, vmax=vmax,
+                extent=[centers[0], centers[-1], mat.shape[0], 0],
+                interpolation="nearest",
+            )
+            ax.set_xlabel(col)
 
-        # ── Heatmap (row-normalised) ──────────────────────────────────────────
-        ax = axes[row, 0]
-        im = ax.imshow(
-            mat_norm[sort_order], aspect="auto", cmap="RdBu_r",
-            vmin=-1, vmax=1,
-            extent=[centers[0], centers[-1], mat.shape[0], 0],
-            interpolation="nearest",
-        )
-        plt.colorbar(im, ax=ax, label="Normalised residual (a.u.)", shrink=0.8)
-        ax.set_xlabel(col)
+        elif kind == "categorical":
+            mat    = np.array(profiles[f"{col}_cat_profiles"])
+            labels = list(profiles[f"{col}_cat_labels"])
+            if row_normalise:
+                row_max = np.nanmax(np.abs(mat), axis=1, keepdims=True)
+                row_max[row_max == 0] = np.nan
+                mat_plot = mat / row_max
+                vmin, vmax = -1, 1
+            else:
+                mat_plot = mat
+                absmax = np.nanmax(np.abs(mat))
+                vmin, vmax = -absmax, absmax
+            sort_order = np.argsort(np.nanargmax(np.abs(mat_plot), axis=1))
+            im = ax.imshow(
+                mat_plot[sort_order], aspect="auto", cmap="RdBu_r",
+                vmin=vmin, vmax=vmax,
+                interpolation="nearest",
+            )
+            ax.set_xticks(range(len(labels)))
+            ax.set_xticklabels(labels)
+            ax.set_xlabel(col)
+
+        cbar_label = "Normalised residual (a.u.)" if row_normalise else "Residual (spikes/bin)"
+        title_suffix = "(row-normalised)" if row_normalise else "(raw)"
+        plt.colorbar(im, ax=ax, label=cbar_label, shrink=0.8)
         ax.set_ylabel("Unit (sorted by peak)")
-        ax.set_title(f"Residual profiles — {col}\n(row-normalised)")
-        sns.despine(ax=ax)
-
-        # ── Strip plot ────────────────────────────────────────────────────────
-        ax = axes[row, 1]
-        mean_abs = np.nanmean(np.abs(mat), axis=1)
-        mean_abs = mean_abs[~np.isnan(mean_abs)]
-
-        rng = np.random.default_rng(0)
-        jitter = rng.uniform(-0.15, 0.15, size=len(mean_abs))
-        ax.scatter(jitter, mean_abs, s=6, alpha=0.4, color="steelblue",
-                   linewidths=0, rasterized=True)
-        ax.axhline(0, color="gray", lw=1, ls="--")
-        ax.axhline(np.median(mean_abs), color="tomato", lw=1.5, ls="--",
-                   label=f"median={np.median(mean_abs):.5f}")
-        ax.set_ylim(0, 0.005)
-        ax.set_xlim(-0.5, 0.5)
-        ax.set_xticks([0]); ax.set_xticklabels([col])
-        ax.set_ylabel("Mean |residual| (spikes/bin)")
-        ax.set_title(f"Distribution across units — {col}")
-        ax.legend(fontsize=8)
+        ax.set_title(f"Residual profiles — {col}\n{title_suffix}")
         sns.despine(ax=ax)
 
     plt.tight_layout()
@@ -1324,6 +1362,67 @@ def plot_model_improvement(diag_dfs, reference, scalars=None):
         sns.despine(ax=ax)
 
     fig.suptitle(f"Model improvement vs reference: {reference}", fontsize=13)
+
+
+def plot_residual_rms(profiles_dicts, covariate_cols=None):
+    """
+    Distribution of per-unit RMS of binned residual profiles, one panel per covariate.
+
+    For each neuron and covariate, computes:
+        RMS = sqrt(mean(binned_profile²))   over bins
+
+    This captures how much systematic structure remains in the residuals without
+    positive/negative cancellation, and is insensitive to number of bins.
+    A model that accounts for a variable will produce flatter profiles → lower RMS.
+
+    Parameters
+    ----------
+    profiles_dicts : dict {model_label: profiles_dict}
+                     profiles_dict is the output of compute_residual_profiles
+    covariate_cols : list of covariate names; inferred from first model if None
+    """
+    if not isinstance(profiles_dicts, dict) or "unit_ids" in profiles_dicts:
+        profiles_dicts = {"model": profiles_dicts}
+
+    if covariate_cols is None:
+        first = next(iter(profiles_dicts.values()))
+        covariate_cols = [k.replace("_profiles", "")
+                          for k in first if k.endswith("_profiles")]
+
+    model_order = list(profiles_dicts.keys())
+    palette     = sns.color_palette("tab10", len(model_order))
+    n_covs      = len(covariate_cols)
+
+    fig, axes = plt.subplots(1, n_covs, figsize=(5 * n_covs, 5),
+                             constrained_layout=True)
+    axes = np.atleast_1d(axes)
+
+    for k, col in enumerate(covariate_cols):
+        ax = axes[k]
+        rows = []
+        for label, prof in profiles_dicts.items():
+            key = f"{col}_profiles"
+            if key not in prof:
+                continue
+            mat = np.array(prof[key])           # (n_units, n_bins)
+            rms = np.sqrt(np.nanmean(mat ** 2, axis=1))  # (n_units,)
+            for v in rms:
+                rows.append({"model": label, "rms": v})
+
+        if not rows:
+            continue
+
+        sub = pd.DataFrame(rows)
+        sns.violinplot(data=sub, x="model", y="rms", order=model_order,
+                       palette=palette, inner="box", cut=0, ax=ax)
+        ax.set_xlabel("")
+        ax.set_ylabel("RMS binned residual (spikes/bin)")
+        ax.set_title(col)
+        ax.tick_params(axis="x", rotation=20)
+        sns.despine(ax=ax)
+
+    fig.suptitle("Per-unit RMS of binned residual profiles", fontsize=13)
+    return fig
 
 
 # ── 5. Visualization ──────────────────────────────────────────────────────────
