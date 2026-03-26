@@ -2,13 +2,14 @@
 Utility functions for GLM encoding analysis (encoding.ipynb).
 
 Sections:
-  1. Data preparation  — interp_col
-  2. GLM fitting       — fit_glm_all_units
-  3. Drop-one analysis — make_drop_one_specs, build_reduced_formula,
+  0. Configuration     : CONFIG, build_model_registry
+  1. Data preparation  : interp_col, load_and_prepare_data
+  2. GLM fitting       : fit_glm_all_units, fit_single_unit, add_spike_history
+  3. Drop-one analysis : make_drop_one_specs, build_reduced_formula,
                          fit_drop_one, run_drop_one_suite, compute_drop_one_lrt
-  4. Diagnostics       — compute_residuals, plot_residuals,
+  4. Diagnostics       : compute_residuals, plot_residuals,
                          compute_ks_rescaled, plot_ks, plot_diagnostics
-  5. Visualization     — set_plot_state, plot_place_field, plot_place_field_grid
+  5. Visualization     : set_plot_state, plot_place_field, plot_place_field_grid
 """
 
 import os, re
@@ -19,13 +20,70 @@ import statsmodels.formula.api as smf
 from scipy.stats import chi2, wilcoxon, spearmanr
 import matplotlib.pyplot as plt
 import seaborn as sns
-import spyglass.linearization.v1 as sgpl
 from statsmodels.stats.multitest import multipletests
 import itertools
 sns.set_context("talk")
 
 
-# ── 1. Data preparation ───────────────────────────────────────────────────────
+# 0. Configuration 
+
+CONFIG = dict(
+    bin_size      = 0.002,
+    speed_min     = 5,
+    speed_max     = 120,
+    speed_df      = 4, #degrees of freedom
+    pos_df        = 8,
+    tp_df         = 6, #trial progress
+    base_dir      = "/media/labuser/NA_1_2025/spyglass/wilbur",
+    wtrack_name   = "Wtrack_wilbur20210512",
+)
+
+
+def build_model_registry(cfg=None):
+    """Return dict of {name: {formula, dataset}} for all encoding models.
+
+    ``dataset`` is "common" (all trials) or "outbound" (outbound only).
+    Callers pair models with the appropriate (cov_df, spike_counts) by key.
+    """
+    cfg = cfg or CONFIG
+    spd = f"bs(speed_scaled, df={cfg['speed_df']})"
+    pos = f"bs(pos_scaled, df={cfg['pos_df']})"
+    tp  = f"cr(trial_progress, df={cfg['tp_df']}, constraints='center')"
+
+    return {
+        "null":                    {"formula": "spike_count ~ 1",                             "dataset": "common"},
+        "null_outbound":           {"formula": "spike_count ~ 1",                             "dataset": "outbound"},
+        "trial_type":              {"formula": "spike_count ~ trial_type",                    "dataset": "common"},
+        "choice":                  {"formula": "spike_count ~ choice",                        "dataset": "outbound"},
+        "speed_spline":            {"formula": f"spike_count ~ {spd}",                        "dataset": "common"},
+        "pos_spline":              {"formula": f"spike_count ~ {pos}",                        "dataset": "common"},
+        "trial_progress_spline":   {"formula": f"spike_count ~ {tp}",                         "dataset": "common"},
+        "full_model":              {"formula": f"spike_count ~ trial_type + {pos} + {spd}",   "dataset": "common"},
+        "temporal_model":          {"formula": f"spike_count ~ trial_type + {tp} + {spd}",    "dataset": "common"},
+        "choice_full_model":       {"formula": f"spike_count ~ choice + {pos} + {spd}",       "dataset": "outbound"},
+        "choice_temporal_model":   {"formula": f"spike_count ~ choice + {tp} + {spd}",        "dataset": "outbound"},
+    }
+
+
+def model_csv_path(registry_key, base_dir=None, cfg=None):
+    """Return the default CSV path for a registry key.
+
+    Existing convention: ``speed_spline`` → ``speed_spline_model_all.csv``,
+    but ``full_model`` → ``full_model_all.csv`` (no double "model").
+    """
+    cfg = cfg or CONFIG
+    base_dir = base_dir or cfg["base_dir"]
+    _OVERRIDES = {"null_outbound": "null_model_out_all"}
+    if registry_key in _OVERRIDES:
+        stem = _OVERRIDES[registry_key]
+    elif registry_key.endswith("_model"):
+        stem = f"{registry_key}_all"
+    else:
+        stem = f"{registry_key}_model_all"
+    return f"{base_dir}/analysis/{stem}.csv"
+
+
+# 1. Data preparation 
 
 def interp_col(col_values, times, bin_centers):
     if pd.api.types.is_numeric_dtype(col_values):
@@ -41,18 +99,182 @@ def interp_col(col_values, times, bin_centers):
         return col_values.iloc[idx].values
 
 
-# ── 2. GLM fitting ────────────────────────────────────────────────────────────
+def load_and_prepare_data(cfg=None):
+    """Load position + spikes, bin, filter, scale.
+
+    Returns a dict with keys:
+        cov_df_common, cov_df_out_common,
+        spike_counts_common, spike_counts_out_common,
+        unit_ids, bin_centers,
+        scaling_params  — dict with pos_min, pos_max, speed_min, speed_max
+    """
+    cfg = cfg or CONFIG
+    base_dir = cfg["base_dir"]
+    bin_size = cfg["bin_size"]
+
+    trialized_position = pd.read_csv(
+        f"{base_dir}/analysis/position/trialized_position.csv", index_col="time"
+    )
+    data = np.load(f"{base_dir}/analysis/final_spikes/mfpc_spikes.npz",
+                   allow_pickle=True)
+    mpfc_spikes = [data[f"arr_{i}"] for i in range(len(data.files))]
+
+    bin_edges = np.arange(
+        trialized_position.index.min(),
+        trialized_position.index.max() + bin_size,
+        bin_size,
+    )
+    bin_centers = bin_edges[:-1] + bin_size / 2
+    spike_counts = np.array(
+        [np.histogram(s, bins=bin_edges)[0] for s in mpfc_spikes]
+    )
+
+    # interpolate covariates to 2ms bins
+    cols_to_interp = [c for c in trialized_position.columns
+                      if c != "video_frame_ind"]
+    times = trialized_position.index.astype(float).values
+    interpolated = {col: interp_col(trialized_position[col], times, bin_centers)
+                    for col in cols_to_interp}
+    interp_pos = pd.DataFrame(interpolated, columns=cols_to_interp)
+    interp_pos.insert(0, "time_bin_center", bin_centers)
+
+    # base mask: run zone, outbound + inbound
+    base_mask = (
+        (interp_pos["zone"] == "run")
+        & (interp_pos["trial_type"].isin(["outbound", "inbound"]))
+    )
+    cov_df = interp_pos[base_mask].rename(columns={"left/right": "choice"})
+    spike_counts_masked = spike_counts[:, base_mask]
+    unit_ids = np.arange(len(spike_counts_masked))
+
+    # common mask: speed + position filters
+    common_mask = (
+        cov_df["speed"].notna()
+        & (cov_df["speed"] > cfg["speed_min"])
+        & (cov_df["speed"] < cfg["speed_max"])
+        & cov_df["linear_position"].notna()
+    )
+    cov_df_common = cov_df[common_mask].copy()
+    spike_counts_common = spike_counts_masked[:, common_mask]
+
+    speed_min_val = cov_df_common["speed"].min()
+    speed_max_val = cov_df_common["speed"].max()
+    pos_min_val   = cov_df_common["linear_position"].min()
+    pos_max_val   = cov_df_common["linear_position"].max()
+
+    cov_df_common["speed_scaled"] = (
+        (cov_df_common["speed"] - speed_min_val) / (speed_max_val - speed_min_val)
+    )
+    cov_df_common["pos_scaled"] = (
+        (cov_df_common["linear_position"] - pos_min_val) / (pos_max_val - pos_min_val)
+    )
+
+    # outbound-only subset
+    outbound_common_mask = common_mask & (cov_df["trial_type"] == "outbound")
+    cov_df_out_common = cov_df[outbound_common_mask].copy()
+    spike_counts_out_common = spike_counts_masked[:, outbound_common_mask]
+    cov_df_out_common["speed_scaled"] = (
+        (cov_df_out_common["speed"] - speed_min_val) / (speed_max_val - speed_min_val)
+    )
+    cov_df_out_common["pos_scaled"] = (
+        (cov_df_out_common["linear_position"] - pos_min_val) / (pos_max_val - pos_min_val)
+    )
+
+    # correct trials: outbound + inbound, no zone or speed filter
+    correct_mask = interp_pos["trial_type"].isin(["outbound", "inbound"])
+    cov_df_correct = interp_pos[correct_mask].rename(columns={"left/right": "choice"})
+    spike_counts_correct = spike_counts[:, correct_mask]
+
+    return dict(
+        cov_df_correct       = cov_df_correct,
+        spike_counts_correct = spike_counts_correct,
+        cov_df_common        = cov_df_common,
+        cov_df_out_common    = cov_df_out_common,
+        spike_counts_common  = spike_counts_common,
+        spike_counts_out_common = spike_counts_out_common,
+        unit_ids             = unit_ids,
+        bin_centers          = bin_centers,
+        scaling_params       = dict(
+            pos_min  = pos_min_val,
+            pos_max  = pos_max_val,
+            speed_min = speed_min_val,
+            speed_max = speed_max_val,
+        ),
+    )
+
+
+def bin_and_average(values, bin_by, n_bins=50):
+    """Bin ``values`` by ``bin_by`` and return (bin_centers, bin_means)."""
+    edges = np.linspace(np.nanmin(bin_by), np.nanmax(bin_by), n_bins + 1)
+    idx = np.clip(np.digitize(bin_by, edges) - 1, 0, n_bins - 1)
+    centers = (edges[:-1] + edges[1:]) / 2
+    means = np.array([values[idx == b].mean() if (idx == b).any() else np.nan
+                       for b in range(n_bins)])
+    return centers, means
+
+
+def load_model_outputs(model_name, base_dir=None, cfg=None):
+    """Load CSV diagnostics + NPZ residual profiles for a fitted model.
+
+    Returns (diag_df, profiles_dict).
+    """
+    cfg = cfg or CONFIG
+    base_dir = base_dir or cfg["base_dir"]
+    diag = pd.read_csv(
+        f"{base_dir}/analysis/diagnostics_{model_name}.csv", index_col=0
+    )
+    raw = np.load(
+        f"{base_dir}/analysis/residual_profiles_{model_name}.npz",
+        allow_pickle=True,
+    )
+    profiles = {k: raw[k] for k in raw.files}
+    return diag, profiles
+
+
+# 2. GLM fitting 
 
 def fit_glm_all_units(formula: str,
                       cov_df: pd.DataFrame,
                       spike_counts_masked: np.array,
                       unit_ids: np.array,
-                      bin_size = 0.002):
+                      bin_size = 0.002,
+                      per_unit_transform = None,
+                      save_path = None,
+                      model_name = None,
+                      refit = False):
+    """Fit a Poisson GLM for each unit and collect summary statistics.
+
+    Parameters
+    ----------
+    per_unit_transform : callable, optional
+        ``fn(df, spike_counts_1d, unit_index) -> df``.  Called after adding
+        ``spike_count`` to *df*.  Use this to inject unit-specific covariates
+        (e.g. spike history).  The returned DataFrame may be shorter than the
+        input (rows with NaN history bins are typically dropped).
+    save_path : str, optional
+        CSV path for caching.  When the file exists and *refit* is False,
+        read from disk instead of fitting.  Results are saved here after fitting.
+    model_name : str, optional
+        Registry key (e.g. ``"speed_spline"``).  If *save_path* is not given,
+        the default CSV path is derived via ``model_csv_path(model_name)``.
+    refit : bool
+        If True, always fit even when the cached CSV exists on disk.
+    """
+    if save_path is None and model_name is not None:
+        save_path = model_csv_path(model_name)
+    if save_path and not refit and os.path.exists(save_path):
+        print(f"Loading cached fit from {save_path}")
+        cached = pd.read_csv(save_path, index_col=0)
+        if model_name is not None and "model" not in cached.columns:
+            cached["model"] = model_name
+        return cached
 
     rows = []
     for i, uid in enumerate(unit_ids):
         df = cov_df.copy()
         df["spike_count"] = spike_counts_masked[i]  # pre-masked counts
+        if per_unit_transform is not None:
+            df = per_unit_transform(df, spike_counts_masked[i], i)
         try:
             res = smf.glm(formula, data=df, family=sm.families.Poisson()).fit(disp=False)
             rows.append(dict(
@@ -77,10 +299,50 @@ def fit_glm_all_units(formula: str,
                 df_model=np.nan, error=str(e)
             ))
 
-    return pd.DataFrame(rows)
+    result = pd.DataFrame(rows)
+    if model_name is not None:
+        result["model"] = model_name
+    if save_path:
+        result.to_csv(save_path)
+        print(f"Saved {len(result)} units : {save_path}")
+    return result
 
 
-# ── 3. Drop-one analysis ──────────────────────────────────────────────────────
+def fit_single_unit(formula, cov_df, spike_counts, unit_idx,
+                    family=None, per_unit_transform=None):
+    """Fit one unit interactively and return the GLMResults object."""
+    if family is None:
+        family = sm.families.Poisson()
+    df = cov_df.copy()
+    df["spike_count"] = spike_counts[unit_idx]
+    if per_unit_transform is not None:
+        df = per_unit_transform(df, spike_counts[unit_idx], unit_idx)
+    return smf.glm(formula, data=df, family=family).fit(disp=False)
+
+
+def add_spike_history(df, spike_counts_unit, unit_idx,
+                      windows_ms=((0, 2), (2, 10), (10, 50), (50, 200)),
+                      bin_size=0.002):
+    """Add windowed spike-history covariates for one unit.
+
+    For each (lo_ms, hi_ms) window, counts spikes in the interval
+    (t - hi, t - lo] and stores the result as ``hist_{lo}_{hi}ms``.
+    Rows where any history window is undefined (edge bins) are dropped.
+
+    Designed as a ``per_unit_transform`` callback for ``fit_glm_all_units``.
+    """
+    for lo_ms, hi_ms in windows_ms:
+        lo_bins = int(lo_ms / (bin_size * 1000))
+        hi_bins = int(hi_ms / (bin_size * 1000))
+        cs = np.concatenate([[0], np.cumsum(spike_counts_unit)])
+        col = np.full(len(df), np.nan)
+        valid = np.arange(hi_bins, len(df))
+        col[valid] = cs[valid - lo_bins] - cs[valid - hi_bins]
+        df[f"hist_{lo_ms}_{hi_ms}ms"] = col
+    return df.dropna()
+
+
+# 3. Drop-one analysis
 
 def build_reduced_formula(spec: dict,
                          drop_term: str):
@@ -139,46 +401,79 @@ def run_drop_one_suite(drop_one_specs: dict,
     return result_list
 
 
-def make_drop_one_specs(cov_df_common, spike_counts_common,
-                        cov_df_out_common, spike_counts_out_common,
-                        base_dir, tp_df=6, pos_df=8, speed_df=4):
-    tp   = f"cr(trial_progress, df = {tp_df}, constraints = 'center')"
-    pos  = f"bs(pos_scaled, df = {pos_df})"
-    spd  = f"bs(speed_scaled, df = {speed_df})"
-    return {
-        "temporal_model_all": {
-            "formula_lhs": "spike_count",
-            "terms": ["trial_type", tp, spd],
-            "delta_df": {"trial_type": 1, tp: tp_df, spd: speed_df},
-            "cov_df": cov_df_common,
-            "spike_counts": spike_counts_common,
-            "null_csv": f"{base_dir}/analysis/null_model_all.csv",
-        },
-        "full_model_all": {
-            "formula_lhs": "spike_count",
-            "terms": ["trial_type", pos, spd],
-            "delta_df": {"trial_type": 1, pos: pos_df, spd: speed_df},
-            "cov_df": cov_df_common,
-            "spike_counts": spike_counts_common,
-            "null_csv": f"{base_dir}/analysis/null_model_all.csv",
-        },
-        # "choice_full_model_all": {
-        #     "formula_lhs": "spike_count",
-        #     "terms": ["choice", pos, spd],
-        #     "delta_df": {"choice": 1, pos: pos_df, spd: speed_df},
-        #     "cov_df": cov_df_out_common,
-        #     "spike_counts": spike_counts_out_common,
-        #     "null_csv": f"{base_dir}/analysis/null_model_out_all.csv",
-        # },
-        # "choice_temporal_model_all": {
-        #     "formula_lhs": "spike_count",
-        #     "terms": ["choice", tp, spd],
-        #     "delta_df": {"choice": 1, tp: tp_df, spd: speed_df},
-        #     "cov_df": cov_df_out_common,
-        #     "spike_counts": spike_counts_out_common,
-        #     "null_csv": f"{base_dir}/analysis/null_model_out_all.csv",
-        # },
+def _parse_formula_terms(formula):
+    """Split a patsy formula's RHS into individual additive terms."""
+    rhs = formula.split("~", 1)[1].strip()
+    # Split on '+' that is NOT inside parentheses
+    terms = []
+    depth = 0
+    current = []
+    for ch in rhs:
+        if ch == '(':
+            depth += 1
+        elif ch == ')':
+            depth -= 1
+        elif ch == '+' and depth == 0:
+            terms.append("".join(current).strip())
+            current = []
+            continue
+        current.append(ch)
+    terms.append("".join(current).strip())
+    return [t for t in terms if t]
+
+
+def _infer_term_df(term):
+    """Extract degrees of freedom from a spline term string.
+
+    Returns the df value for spline terms (bs/cr), or 1 for plain
+    categorical/continuous terms.
+    """
+    m = re.search(r'df\s*=\s*(\d+)', term)
+    return int(m.group(1)) if m else 1
+
+
+def make_drop_one_specs(datasets, model_names, base_dir=None,
+                        registry=None, cfg=None):
+    """Build drop-one specs from the model registry.
+
+    Parameters
+    ----------
+    datasets : dict
+        ``{"common": (cov_df, spike_counts), "outbound": (cov_df, spike_counts)}``
+    model_names : list of str
+        Keys into *registry* for which to build drop-one specs.
+    base_dir : str, optional
+    registry : dict, optional — from ``build_model_registry()``.
+    cfg : dict, optional — falls back to ``CONFIG``.
+    """
+    cfg = cfg or CONFIG
+    base_dir = base_dir or cfg["base_dir"]
+    if registry is None:
+        registry = build_model_registry(cfg)
+
+    null_csv = {
+        "common":   f"{base_dir}/analysis/null_model_all.csv",
+        "outbound": f"{base_dir}/analysis/null_model_out_all.csv",
     }
+
+    specs = {}
+    for name in model_names:
+        entry = registry[name]
+        formula = entry["formula"]
+        ds_key  = entry["dataset"]
+        terms   = _parse_formula_terms(formula)
+
+        cov_df, spike_counts = datasets[ds_key]
+        specs[f"{name}_all"] = {
+            "formula_lhs": formula.split("~")[0].strip(),
+            "terms": terms,
+            "delta_df": {t: _infer_term_df(t) for t in terms},
+            "cov_df": cov_df,
+            "spike_counts": spike_counts,
+            "null_csv": null_csv[ds_key],
+        }
+
+    return specs
 
 
 def compute_drop_one_lrt(model_name, base_dir, drop_one_specs):
@@ -328,7 +623,7 @@ def plot_drop_one_summary(drop_one_results, pairwise_pvals=None,
     ncols = 3 if pairwise_pvals is not None else 2
     fig, axes = plt.subplots(1, ncols, figsize=(6 * ncols, 5))
 
-    # A ── % units above partial R² threshold
+ # A % units above partial R² threshold
     ax = axes[0]
     agg_order = (df.groupby("term_label")["partial_r2"]
                    .apply(lambda x: (x > r2_thresholds[0]).mean())
@@ -349,7 +644,7 @@ def plot_drop_one_summary(drop_one_results, pairwise_pvals=None,
     ax.set_ylabel("% units"); ax.set_title("Unique contribution (partial R²)")
     ax.legend(fontsize=8); sns.despine(ax=ax)
 
-    # B ── effect size violin
+ # B effect size violin
     ax = axes[1]
     sns.violinplot(data=df, x="partial_r2", y="term_label", order=term_order,
                    inner="box", cut=0, color="steelblue", ax=ax)
@@ -358,7 +653,7 @@ def plot_drop_one_summary(drop_one_results, pairwise_pvals=None,
     ax.set_ylabel(""); ax.set_title("Effect size (partial R²)")
     ax.legend(fontsize=8); sns.despine(ax=ax)
 
-    # C ── pairwise heatmap
+ # C pairwise heatmap
     if pairwise_pvals is not None:
         ax = axes[2]
         pw  = pairwise_pvals.rename(index=term_labels, columns=term_labels)
@@ -387,29 +682,57 @@ def plot_drop_one_summary(drop_one_results, pairwise_pvals=None,
 
 
 
-# ── 4. Diagnostics — residuals & KS test ─────────────────────────────────────
+# 4. Diagnostics — residuals & KS test
 
-def compute_residuals(results, spike_counts, cov_df):
+def _align_to_model(results, spike_counts=None, cov_df=None):
+    """Align spike_counts and cov_df to the rows the model was actually fitted on.
+
+    When a per_unit_transform (e.g. add_spike_history) drops leading rows,
+    the model sees fewer bins than the original arrays.  This helper detects
+    the mismatch and tail-trims the inputs to match.
+
+    Returns (observed, cov_df) — either or both may be None if not requested.
+    """
+    n_fit = int(results.nobs)
+    observed = np.asarray(results.model.endog)
+
+    if cov_df is not None:
+        if len(cov_df) != n_fit:
+            cov_df = cov_df.iloc[-n_fit:].reset_index(drop=True)
+        else:
+            cov_df = cov_df.copy().reset_index(drop=True)
+
+    return observed, cov_df
+
+
+def compute_residuals(results, spike_counts=None, cov_df=None):
     """
     Compute per-bin raw and cumulative residuals for a fitted Poisson GLM.
 
     raw_residual_i      = observed_i - predicted_i   (spike counts per bin)
     cumulative_residual = cumsum(raw_residual)        (integrated misfit)
 
-    Returns a copy of cov_df with two extra columns:
+    Returns a DataFrame with covariate columns (if cov_df given) plus:
       raw_residual        : observed minus E[N|X] per bin
       cumulative_residual : running cumulative sum of raw_residual over time
 
     Parameters
     ----------
     results      : fitted statsmodels GLM result object (res.predict() must work)
-    spike_counts : 1-D array, shape (n_bins,), observed spike counts for one unit
-    cov_df       : covariate DataFrame used to fit the model (n_bins rows)
+    spike_counts : ignored (kept for backward compatibility); observed counts
+                   are read from results.model.endog so alignment is automatic.
+    cov_df       : covariate DataFrame. If longer than the fitted model (e.g.
+                   because add_spike_history dropped leading rows), it is
+                   automatically tail-trimmed to match.
     """
     predicted = np.asarray(results.predict())
-    raw = np.asarray(spike_counts, dtype=float) - predicted
+    observed, cov_df = _align_to_model(results, cov_df=cov_df)
+    raw = observed - predicted
 
-    df = cov_df.copy().reset_index(drop=True)
+    if cov_df is not None:
+        df = cov_df
+    else:
+        df = pd.DataFrame(index=range(len(predicted)))
     df["raw_residual"]        = raw
     df["cumulative_residual"] = np.cumsum(raw)
     return df
@@ -479,7 +802,7 @@ def plot_residuals(residuals_df, n_bins=50, title="",
 
     ax_idx = 0
 
-    # ── Optional: cumulative residual vs time (first epoch only) ─────────────
+ # Optional: cumulative residual vs time (first epoch only)
     if show_cumulative:
         ax = axes[ax_idx]; ax_idx += 1
 
@@ -517,11 +840,7 @@ def plot_residuals(residuals_df, n_bins=50, title="",
             cov_vals = residuals_df.loc[valid, col].values
 
             # Binned mean residual
-            bins       = np.linspace(cov_vals.min(), cov_vals.max(), n_bins + 1)
-            idx        = np.clip(np.digitize(cov_vals, bins) - 1, 0, n_bins - 1)
-            centers    = (bins[:-1] + bins[1:]) / 2
-            mean_resid = np.array([res_vals[idx == b].mean() if (idx == b).any()
-                                   else np.nan for b in range(n_bins)])
+            centers, mean_resid = bin_and_average(res_vals, cov_vals, n_bins)
 
             # CUSUM sorted by covariate value
             sort_order = np.argsort(cov_vals)
@@ -531,7 +850,8 @@ def plot_residuals(residuals_df, n_bins=50, title="",
             ax.plot(x_cusum, cusum, lw=0.8, color=CUSUM_COLOR, alpha=0.7)
             ax.axhline(0, color=CUSUM_COLOR, lw=0.8, ls="--")
             ax2 = ax.twinx()
-            ax2.bar(centers, mean_resid, width=(bins[1] - bins[0]) * 0.9,
+            bar_w = (centers[-1] - centers[0]) / max(len(centers) - 1, 1) * 0.9
+            ax2.bar(centers, mean_resid, width=bar_w,
                     color=RESID_COLOR, alpha=0.4)
             ax2.axhline(0, color=RESID_COLOR, lw=0.8, ls="--")
 
@@ -584,7 +904,7 @@ def _compute_z_unsorted(predicted, spike_counts):
     return np.array(z_vals)
 
 
-def compute_ks_rescaled(results, spike_counts):
+def compute_ks_rescaled(results, spike_counts=None):
     """
     Apply the Time Rescaling Theorem to obtain Uniform(0,1) test statistics.
 
@@ -608,10 +928,12 @@ def compute_ks_rescaled(results, spike_counts):
     Parameters
     ----------
     results      : fitted statsmodels GLM result
-    spike_counts : 1-D int array, shape (n_bins,), observed spike counts
+    spike_counts : ignored (kept for backward compatibility); observed counts
+                   are read from results.model.endog so alignment is automatic.
     """
     predicted = np.asarray(results.predict())
-    return np.sort(_compute_z_unsorted(predicted, spike_counts))
+    observed, _ = _align_to_model(results)
+    return np.sort(_compute_z_unsorted(predicted, observed))
 
 
 def plot_ks(z_vals, alpha=0.05, ax=None, title = None):
@@ -717,7 +1039,7 @@ def plot_diagnostics_batch(unit_list, formula, cov_df, spike_counts_masked, unit
             continue
         i = matches[0]
 
-        # ── fit GLM ───────────────────────────────────────────────────────────
+ # fit GLM
         df = cov_df.copy()
         df["spike_count"] = spike_counts_masked[i]
         try:
@@ -731,11 +1053,12 @@ def plot_diagnostics_batch(unit_list, formula, cov_df, spike_counts_masked, unit
             continue
 
         predicted = np.asarray(res.predict())
-        raw       = spike_counts_masked[i].astype(float) - predicted
+        observed, cov_df_fit = _align_to_model(res, cov_df=cov_df)
+        raw = observed - predicted
 
         col_idx = 0
 
-        # ── Optional: cumulative residual vs time ─────────────────────────────
+ # Optional: cumulative residual vs time
         if show_cumulative:
             ax = axes[row_idx, col_idx]; col_idx += 1
             cumresid = np.cumsum(raw)
@@ -748,28 +1071,23 @@ def plot_diagnostics_batch(unit_list, formula, cov_df, spike_counts_masked, unit
             ax.tick_params(labelsize=7)
             sns.despine(ax=ax)
 
-        # ── Covariate panels ──────────────────────────────────────────────────
+ # Covariate panels
         cont_ax_indices = []
         for col, kind in active.items():
             ax = axes[row_idx, col_idx]; col_idx += 1
-            valid    = cov_df[col].notna().values
+            valid    = cov_df_fit[col].notna().values
             res_vals = raw[valid]
 
             if kind == "continuous":
-                cov_vals   = cov_df[col].values[valid]
-                bins       = np.linspace(cov_vals.min(), cov_vals.max(), n_bins + 1)
-                bin_idx    = np.clip(np.digitize(cov_vals, bins) - 1, 0, n_bins - 1)
-                centers    = (bins[:-1] + bins[1:]) / 2
-                mean_resid = np.array([res_vals[bin_idx == b].mean()
-                                       if (bin_idx == b).any() else np.nan
-                                       for b in range(n_bins)])
+                cov_vals = cov_df_fit[col].values[valid]
+                centers, mean_resid = bin_and_average(res_vals, cov_vals, n_bins)
                 ax.plot(centers, mean_resid, lw=1.2, color=RESID_COLOR)
                 ax.axhline(0, color=RESID_COLOR, lw=0.8, ls="--")
                 ax.set_ylabel("Mean resid.\n(spikes/bin)", fontsize=8, color=RESID_COLOR)
                 cont_ax_indices.append(col_idx - 1)
 
             elif kind == "categorical":
-                cat_vals = cov_df[col].values[valid]
+                cat_vals = cov_df_fit[col].values[valid]
                 cats     = sorted(set(cat_vals[~pd.isnull(cat_vals)]))
                 means    = np.array([res_vals[cat_vals == c].mean() for c in cats])
                 sems     = np.array([res_vals[cat_vals == c].std() /
@@ -792,9 +1110,9 @@ def plot_diagnostics_batch(unit_list, formula, cov_df, spike_counts_masked, unit
             for ax in cont_axes:
                 ax.set_ylim(-max_abs, max_abs)
 
-        # ── KS panel ─────────────────────────────────────────────────────────
+ # KS panel
         ax = axes[row_idx, col_idx]
-        z  = compute_ks_rescaled(res, spike_counts_masked[i])
+        z  = compute_ks_rescaled(res)
         n  = len(z)
         if n > 0:
             ecdf    = np.arange(1, n + 1) / n
@@ -825,7 +1143,7 @@ def plot_diagnostics_batch(unit_list, formula, cov_df, spike_counts_masked, unit
     fig.suptitle("GLM diagnostics — selected units", fontsize=12)
 
 
-def plot_diagnostics(results, spike_counts, cov_df,
+def plot_diagnostics(results, spike_counts=None, cov_df=None,
                      n_bins=50, unit_label="", alpha=0.05,
                      panels=None, show_cumulative=False):
     """
@@ -837,8 +1155,10 @@ def plot_diagnostics(results, spike_counts, cov_df,
     Parameters
     ----------
     results         : fitted statsmodels GLM result
-    spike_counts    : 1-D array (n_bins,) for this unit
-    cov_df          : covariate DataFrame (n_bins rows)
+    spike_counts    : ignored (kept for backward compatibility); observed counts
+                      are read from the fitted model automatically.
+    cov_df          : covariate DataFrame. Auto-trimmed to match model rows if
+                      longer (e.g. when add_spike_history dropped leading rows).
     n_bins          : bins for continuous covariate residual plots
     unit_label      : string identifier shown in plot titles
     alpha           : CI level for KS bands (default 0.05)
@@ -846,12 +1166,12 @@ def plot_diagnostics(results, spike_counts, cov_df,
         Forwarded to plot_residuals. Defaults to DEFAULT_PANELS.
     show_cumulative : bool — include the cumulative residual vs time panel.
     """
-    residuals_df = compute_residuals(results, spike_counts, cov_df)
+    residuals_df = compute_residuals(results, cov_df=cov_df)
     plot_residuals(residuals_df, n_bins=n_bins,
                    title=f"Residuals — {unit_label}",
                    panels=panels, show_cumulative=show_cumulative)
 
-    z_vals = compute_ks_rescaled(results, spike_counts)
+    z_vals = compute_ks_rescaled(results)
     fig, ax = plt.subplots(figsize=(5, 5))
     plot_ks(z_vals, alpha=alpha, ax=ax, title=f"KS — {unit_label}",)
     plt.tight_layout()
@@ -898,7 +1218,7 @@ def compute_model_diagnostics(formula, cov_df, spike_counts_masked, unit_ids,
     else:
         indices  = list(range(len(unit_ids_arr)))
 
-    # ── pre-compute bin edges for profiles ────────────────────────────────────
+ # pre-compute bin edges for profiles
     bin_edges   = {}
     bin_centers = {}
     for col in covariate_cols:
@@ -939,15 +1259,16 @@ def compute_model_diagnostics(formula, cov_df, spike_counts_masked, unit_ids,
             continue
 
         predicted = np.asarray(res.predict())
-        raw       = spike_counts_masked[i].astype(float) - predicted
-        n_spikes  = int((spike_counts_masked[i] > 0).sum())
+        observed, cov_df_fit = _align_to_model(res, cov_df=cov_df)
+        raw       = observed - predicted
+        n_spikes  = int((observed > 0).sum())
 
-        # ── drift AUC ─────────────────────────────────────────────────────────
+ # drift AUC
         cumresid  = np.cumsum(raw)
         drift_auc = np.abs(cumresid).mean() / max(n_spikes, 1)
 
-        # ── KS D + z autocorrelation ──────────────────────────────────────────
-        z_unsorted = _compute_z_unsorted(predicted, spike_counts_masked[i])
+ # KS D + z autocorrelation
+        z_unsorted = _compute_z_unsorted(predicted, observed)
         if len(z_unsorted) >= 4:
             z_sorted      = np.sort(z_unsorted)
             n             = len(z_sorted)
@@ -957,14 +1278,14 @@ def compute_model_diagnostics(formula, cov_df, spike_counts_masked, unit_ids,
         else:
             ks_D, z_autocorr = np.nan, np.nan
 
-        # ── residual η² per covariate ─────────────────────────────────────────
+ # residual η² per covariate
         row      = dict(unit=uid, converged=True,
                         ks_D=ks_D, ks_z_autocorr=float(z_autocorr), drift_auc=drift_auc)
         ss_total = float(np.sum(raw ** 2))
         for col in covariate_cols:
-            valid_mask = ~np.isnan(cov_df[col].values)
+            valid_mask = ~np.isnan(cov_df_fit[col].values)
             if valid_mask.sum() > 10 and ss_total > 0:
-                cov_vals = cov_df[col].values[valid_mask]
+                cov_vals = cov_df_fit[col].values[valid_mask]
                 res_vals = raw[valid_mask]
                 bins     = np.linspace(cov_vals.min(), cov_vals.max(), 51)
                 bin_idx  = np.clip(np.digitize(cov_vals, bins) - 1, 0, 49)
@@ -977,10 +1298,10 @@ def compute_model_diagnostics(formula, cov_df, spike_counts_masked, unit_ids,
                 row[f"resid_eta2_{col}"] = np.nan
         diag_rows.append(row)
 
-        # ── residual profiles ─────────────────────────────────────────────────
+ # residual profiles
         for col in covariate_cols:
-            valid_mask = ~np.isnan(cov_df[col].values)
-            cov_vals   = cov_df[col].values[valid_mask]
+            valid_mask = ~np.isnan(cov_df_fit[col].values)
+            cov_vals   = cov_df_fit[col].values[valid_mask]
             res_vals   = raw[valid_mask]
             idx        = np.clip(np.digitize(cov_vals, bin_edges[col]) - 1, 0, n_bins - 1)
             means      = np.array([
@@ -988,11 +1309,11 @@ def compute_model_diagnostics(formula, cov_df, spike_counts_masked, unit_ids,
                 for b in range(n_bins)
             ])
             profile_rows[col].append(means)
-        # ── categorical profiles ──────────────────────────────────────────────
+ # categorical profiles
         for col in categorical_cols:
-            if col not in cov_df.columns:
+            if col not in cov_df_fit.columns:
                 continue
-            cat_vals = cov_df[col].values
+            cat_vals = cov_df_fit[col].values
             means = np.array([
                 raw[cat_vals == c].mean() if (cat_vals == c).any() else np.nan
                 for c in cat_labels[col]
@@ -1077,7 +1398,7 @@ def plot_diagnostics_population(diag_dfs, covariate_cols=None, alpha=0.05):
         covariate_cols = _infer_covariate_cols(long_df)
     palette = sns.color_palette("tab10", n_models)
 
-    # ── Figure 1: timing & stationarity ──────────────────────────────────────
+ # Figure 1: timing & stationarity
     fig1, axes = plt.subplots(1, 3, figsize=(15, 5), constrained_layout=True)
 
     ax = axes[0]
@@ -1106,7 +1427,7 @@ def plot_diagnostics_population(diag_dfs, covariate_cols=None, alpha=0.05):
 
     fig1.suptitle("Population diagnostics — timing & stationarity", fontsize=13)
 
-    # ── Figure 2: covariate residual structure ────────────────────────────────
+ # Figure 2: covariate residual structure
     eta2_cols = [f"resid_eta2_{c}" for c in covariate_cols]
     melt_df   = long_df.melt(id_vars=["unit", "model"], value_vars=eta2_cols,
                               var_name="covariate", value_name="eta2")
@@ -1425,8 +1746,7 @@ def plot_residual_rms(profiles_dicts, covariate_cols=None):
     return fig
 
 
-# ── 5. Visualization ──────────────────────────────────────────────────────────
-# Shared state for plot functions — set via set_plot_state() after fitting
+# 5. Visualization 
 
 _plot_state = {
     "rate_matrix":  None,
@@ -1455,7 +1775,7 @@ def plot_place_field(uid, ax_curve=None, ax_track=None, graph=None):
     if standalone:
         fig, (ax_curve, ax_track) = plt.subplots(1, 2, figsize=(13, 4))
 
-    # ── rate curve ────────────────────────────────────────────────────────────
+ # rate curve
     ax_curve.plot(pos_pred_vals, rate, color="steelblue", lw=1.5)
     ax_curve.axvline(peak_pos_cm[uid], color="red", lw=1, ls="--",
                      label=f"peak @ {peak_pos_cm[uid]:.0f} cm")
@@ -1465,10 +1785,11 @@ def plot_place_field(uid, ax_curve=None, ax_track=None, graph=None):
     ax_curve.legend(fontsize=8)
     sns.despine(ax=ax_curve)
 
-    # ── track heatmap ─────────────────────────────────────────────────────────
+ # track heatmap
     track_rate = np.interp(pos_run["linear_position"], pos_pred_vals, rate)
     if graph is None:
-        graph = sgpl.TrackGraph & {"track_graph_name": "Wtrack_wilbur20210512"}
+        import spyglass.linearization.v1 as sgpl
+        graph = sgpl.TrackGraph & {"track_graph_name": CONFIG["wtrack_name"]}
     graph.plot_track_graph(ax=ax_track, draw_edge_labels=False)
     for ln in ax_track.lines:
         ln.set_color("lightgrey")
@@ -1541,6 +1862,245 @@ def plot_categorical_comparison(results, cat_col, cov_df, bin_size=0.002, ax=Non
     ax.set_xticklabels(cats)
     ax.set_ylabel("Firing rate (Hz)")
     ax.set_xlabel(cat_col)
+    ax.legend(fontsize=8)
+    sns.despine(ax=ax)
+
+    if standalone:
+        plt.tight_layout()
+
+
+def compute_marginal_effect(results, term_pattern, sweep_values,
+                            sweep_col, cov_df, bin_size=None):
+    """Compute marginal firing-rate curve for one term, averaging over all others.
+
+    For each sweep point, the linear predictor is decomposed into
+    ``η_term`` (columns matching *term_pattern*) and ``η_other`` (everything
+    else, evaluated at each observed data point).  The marginal rate is
+    ``mean_over_data[ exp(η_term + η_other) ] / bin_size``.
+
+    Parameters
+    ----------
+    results : statsmodels GLMResults
+        Fitted multi-variable model.
+    term_pattern : str
+        Substring matched against ``results.model.exog_names`` to identify the
+        columns belonging to the term (e.g. ``"pos_scaled"``, ``"speed_scaled"``,
+        ``"trial_type"``).
+    sweep_values : array-like
+        Values to sweep the term over.  For continuous terms these are the
+        *scaled* values that enter the formula (e.g. 0–1 for ``pos_scaled``).
+        For categorical terms, pass the category labels.
+    sweep_col : str
+        Column name in the design DataFrame that receives *sweep_values*
+        (e.g. ``"pos_scaled"``).
+    cov_df : DataFrame
+        The covariate DataFrame used during fitting (must contain all columns
+        referenced by the formula).  Used both to construct the sweep design
+        matrix (via Patsy ``design_info``) and to evaluate ``η_other``.
+    bin_size : float, optional
+        Time-bin width in seconds.  Defaults to ``CONFIG["bin_size"]``.
+
+    Returns
+    -------
+    marginal_hz : ndarray, shape ``(len(sweep_values),)``
+        Marginal firing rate in Hz at each sweep point.
+    """
+    import patsy as _patsy
+
+    if bin_size is None:
+        bin_size = CONFIG["bin_size"]
+
+    X_fit = np.asarray(results.model.exog)
+    params = np.asarray(results.params)
+    col_names = results.model.exog_names
+
+    term_cols = [i for i, n in enumerate(col_names) if term_pattern in n]
+    other_cols = [i for i in range(len(col_names)) if i not in term_cols]
+    eta_other = X_fit[:, other_cols] @ params[other_cols]
+
+    # Build sweep design matrix using the model's own design_info
+    design_info = results.model.data.orig_exog.design_info
+    n_sweep = len(sweep_values)
+    sweep_df = cov_df.iloc[:n_sweep].copy()
+    sweep_df[sweep_col] = np.asarray(sweep_values)[:len(sweep_df)]
+    # Fill non-swept columns with neutral values so patsy can evaluate
+    for col in cov_df.columns:
+        if col == sweep_col or col == "spike_count":
+            continue
+        if pd.api.types.is_numeric_dtype(cov_df[col]):
+            sweep_df[col] = cov_df[col].median()
+        else:
+            sweep_df[col] = cov_df[col].mode().iloc[0]
+
+    X_sweep = np.asarray(
+        _patsy.build_design_matrices([design_info], sweep_df,
+                                     return_type="dataframe")[0]
+    )
+    eta_term = X_sweep[:, term_cols] @ params[term_cols]
+
+    # Average exp(η_term + η_other) over all observed data points
+    marginal_hz = np.exp(eta_term[:, None] + eta_other[None, :]).mean(axis=1) / bin_size
+    return marginal_hz
+
+
+def empirical_tuning_curve(cov_df, actual_col, bin_size=None, n_bins=50,
+                           categorical=False):
+    """Compute occupancy-normalized empirical firing-rate curve.
+
+    Parameters
+    ----------
+    cov_df : DataFrame
+        Must contain ``actual_col`` and ``"spike_count"`` columns.
+    actual_col : str
+        Column with the behavioural variable (e.g. ``"linear_position"``).
+    bin_size : float, optional
+    n_bins : int
+        Number of histogram bins (ignored for categorical).
+    categorical : bool
+        If True, group by unique values instead of histogram binning.
+
+    Returns
+    -------
+    x_vals, rate_hz : ndarrays
+        Bin centres (or category labels) and firing rate in Hz.
+    """
+    if bin_size is None:
+        bin_size = CONFIG["bin_size"]
+
+    if categorical:
+        cats = sorted(cov_df[actual_col].dropna().unique())
+        grouped = cov_df.groupby(actual_col)
+        rate_hz = (grouped["spike_count"].sum() / (grouped.size() * bin_size)).reindex(cats).values
+        return np.array(cats), rate_hz
+
+    valid = cov_df[actual_col].notna()
+    vals = cov_df.loc[valid, actual_col].values
+    spk  = cov_df.loc[valid, "spike_count"].values
+    occ, bins = np.histogram(vals, bins=n_bins)
+    spks, _   = np.histogram(vals, bins=bins, weights=spk)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        rate_hz = np.where(occ > 0, spks / (occ * bin_size), np.nan)
+    centers = (bins[:-1] + bins[1:]) / 2
+    return centers, rate_hz
+
+
+def plot_marginal_tuning(results, term_pattern, sweep_col, actual_col,
+                         cov_df, unit_idx=None, min_val=None, max_val=None,
+                         xlabel=None, categorical=False, bin_size=None,
+                         n_bins=50, n_sweep=300, ax=None, title=None,
+                         wtrack=False, pos_run=None):
+    """Plot marginal tuning curve vs empirical rate for one term of a fitted GLM.
+
+    Parameters
+    ----------
+    results : statsmodels GLMResults
+    term_pattern : str
+        Substring to identify design-matrix columns (e.g. ``"pos_scaled"``).
+    sweep_col : str
+        Column name that receives sweep values.
+    actual_col : str
+        Column in *cov_df* with the raw behavioural variable.
+    cov_df : DataFrame
+        Must contain ``"spike_count"`` and all formula columns.
+    unit_idx : int, optional
+        Used only for the title.
+    min_val, max_val : float, optional
+        Natural-unit range.  When provided, sweep values are linearly spaced
+        in natural units and mapped to [0, 1] for scaled columns.
+    xlabel : str, optional
+    categorical : bool
+    bin_size, n_bins, n_sweep : float, int, int
+    ax : matplotlib Axes, optional
+    title : str, optional
+    wtrack : bool
+        If True, render a two-panel W-track heatmap (empirical vs marginal)
+        instead of a line plot.  Requires *pos_run* or a prior ``set_plot_state()``.
+    pos_run : DataFrame, optional
+        Track projection data for W-track plots.
+    """
+    if bin_size is None:
+        bin_size = CONFIG["bin_size"]
+
+ # sweep values
+    if categorical:
+        sweep_values = sorted(cov_df[actual_col].dropna().unique())
+    elif min_val is not None and max_val is not None:
+        natural = np.linspace(min_val, max_val, n_sweep)
+        sweep_values = (natural - min_val) / (max_val - min_val)
+    else:
+        sweep_values = np.linspace(0, 1, n_sweep)
+        natural = sweep_values
+
+ # marginal rate
+    marginal_hz = compute_marginal_effect(
+        results, term_pattern, sweep_values, sweep_col, cov_df, bin_size,
+    )
+
+ # empirical rate
+    emp_x, emp_hz = empirical_tuning_curve(
+        cov_df, actual_col, bin_size=bin_size, n_bins=n_bins,
+        categorical=categorical,
+    )
+
+ # W-track heatmap mode
+    if wtrack:
+        if pos_run is None:
+            pos_run = _plot_state.get("pos_run")
+        if pos_run is None:
+            raise ValueError("pos_run required for wtrack plot")
+
+        if min_val is not None:
+            natural = np.linspace(min_val, max_val, n_sweep)
+        pred_rate_run = np.interp(pos_run["linear_position"], natural, marginal_hz)
+        actual_rate_run = np.interp(pos_run["linear_position"], emp_x, emp_hz)
+        vmax = np.nanpercentile(actual_rate_run, 99)
+
+        import spyglass.linearization.v1 as sgpl
+        graph = sgpl.TrackGraph & {"track_graph_name": CONFIG["wtrack_name"]}
+        unit_label = f"unit {unit_idx}" if unit_idx is not None else ""
+
+        fig, (ax_emp, ax_mod) = plt.subplots(1, 2, figsize=(14, 5))
+        for _ax, rate, _title in [
+            (ax_emp, actual_rate_run, f"{unit_label} — empirical"),
+            (ax_mod, pred_rate_run,   f"{unit_label} — marginal ({title or term_pattern})"),
+        ]:
+            graph.plot_track_graph(ax=_ax, draw_edge_labels=False)
+            for ln in _ax.lines:
+                ln.set_color("lightgrey")
+            sc = _ax.scatter(
+                pos_run["projected_x_position"], pos_run["projected_y_position"],
+                c=rate, cmap="hot_r", s=3, zorder=3, vmin=0, vmax=vmax,
+            )
+            plt.colorbar(sc, ax=_ax, label="Hz", shrink=0.8)
+            _ax.set_title(_title)
+            _ax.set_xlabel("x (cm)"); _ax.set_ylabel("y (cm)")
+        plt.tight_layout()
+        return
+
+ # standard line / bar plot
+    standalone = ax is None
+    if standalone:
+        _, ax = plt.subplots(figsize=(8, 4))
+
+    unit_label = f"unit {unit_idx}, " if unit_idx is not None else ""
+    _title = title or f"{unit_label}{actual_col}"
+
+    if categorical:
+        x = np.arange(len(sweep_values))
+        w = 0.35
+        ax.bar(x - w / 2, emp_hz,      w, color="grey",   alpha=0.8, label="Empirical")
+        ax.bar(x + w / 2, marginal_hz,  w, color="tomato", alpha=0.8, label="Marginal")
+        ax.set_xticks(x)
+        ax.set_xticklabels(sweep_values)
+    else:
+        if min_val is not None:
+            natural = np.linspace(min_val, max_val, n_sweep)
+        ax.plot(emp_x, emp_hz, color="grey", alpha=0.7, lw=1.2, label="Empirical")
+        ax.plot(natural, marginal_hz, color="tomato", lw=2, label="Marginal")
+
+    ax.set_xlabel(xlabel or actual_col)
+    ax.set_ylabel("Firing rate (Hz)")
+    ax.set_title(_title)
     ax.legend(fontsize=8)
     sns.despine(ax=ax)
 
@@ -1638,12 +2198,16 @@ def plot_partial_dependence_grid(results_combined, var_specs, cov_df,
     plt.tight_layout()
 
 
-def plot_wtrack_comparison(uid, cov_df, n_bins=50, results=None, pos_run=None):
+def plot_wtrack_comparison(uid, cov_df, n_bins=50, results=None, pos_run=None,
+                           bin_size=None):
     """Two-panel W-track heatmap: actual (left) vs GLM-predicted (right) firing rate.
 
     When called before set_plot_state(), pass results= (fitted pos_spline model) and
     pos_run= (DataFrame with linear_position, projected_x/y_position columns).
     """
+    if bin_size is None:
+        bin_size = CONFIG["bin_size"]
+
     # Resolve pos_run
     if pos_run is None:
         pos_run = _plot_state["pos_run"]
@@ -1660,7 +2224,7 @@ def plot_wtrack_comparison(uid, cov_df, n_bins=50, results=None, pos_run=None):
         pos_max = cov_df["linear_position"].max()
         pos_pred_vals_local = np.linspace(pos_min, pos_max, 300)
         pos_pred_scaled = (pos_pred_vals_local - pos_min) / (pos_max - pos_min)
-        pred_hz = results.predict(pd.DataFrame({"pos_scaled": pos_pred_scaled})) / 0.002
+        pred_hz = results.predict(pd.DataFrame({"pos_scaled": pos_pred_scaled})) / bin_size
         pred_rate_run = np.interp(pos_run["linear_position"], pos_pred_vals_local, pred_hz)
     else:
         raise ValueError("Either call set_plot_state() first, or pass results=")
@@ -1675,14 +2239,15 @@ def plot_wtrack_comparison(uid, cov_df, n_bins=50, results=None, pos_run=None):
     occ,  bins = np.histogram(actual_pos, bins=n_bins)
     spks, _    = np.histogram(actual_pos, bins=bins, weights=spike_vals)
     with np.errstate(invalid="ignore", divide="ignore"):
-        emp_rate_bins = np.where(occ > 0, spks / (occ * 0.002), 0.0)
+        emp_rate_bins = np.where(occ > 0, spks / (occ * bin_size), 0.0)
     bin_centers = (bins[:-1] + bins[1:]) / 2
 
     # Interpolate empirical onto pos_run positions
     actual_rate_run = np.interp(pos_run["linear_position"], bin_centers, emp_rate_bins)
 
     vmax = np.nanpercentile(actual_rate_run, 99)
-    graph = sgpl.TrackGraph & {"track_graph_name": "Wtrack_wilbur20210512"}
+    import spyglass.linearization.v1 as sgpl
+    graph = sgpl.TrackGraph & {"track_graph_name": CONFIG["wtrack_name"]}
 
     fig, (ax_actual, ax_pred) = plt.subplots(1, 2, figsize=(14, 5))
     for ax, rate_run, title in [
@@ -1711,6 +2276,7 @@ def plot_place_field_grid(unit_list, ncols=4):
 
     n = len(unit_list)
     nrows = int(np.ceil(n / ncols))
+    import spyglass.linearization.v1 as sgpl
     graph = sgpl.TrackGraph & {"track_graph_name": "Wtrack_wilbur20210512"}
 
     fig, axes = plt.subplots(nrows, ncols, figsize=(ncols * 4, nrows * 3.5))
