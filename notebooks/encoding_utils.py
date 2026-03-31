@@ -8,11 +8,14 @@ Sections:
   3. Drop-one analysis : make_drop_one_specs, build_reduced_formula,
                          fit_drop_one, run_drop_one_suite, compute_drop_one_lrt
   4. Diagnostics       : compute_residuals, plot_residuals,
-                         compute_ks_rescaled, plot_ks, plot_diagnostics
+                         compute_ks_rescaled, plot_ks,
+                         _simulate_autoregressive, plot_predicted_isi,
+                         plot_diagnostics
   5. Visualization     : set_plot_state, plot_place_field, plot_place_field_grid
 """
 
 import os, re
+from functools import partial
 import numpy as np
 import pandas as pd
 import statsmodels.api as sm
@@ -81,6 +84,38 @@ def model_csv_path(registry_key, base_dir=None, cfg=None):
     else:
         stem = f"{registry_key}_model_all"
     return f"{base_dir}/analysis/{stem}.csv"
+
+
+def resolve_model_name(model_name, fit_history=False, cfg=None):
+    """Resolve model key/stem to history or non-history naming convention.
+
+    Supports both registry keys (e.g. ``full_model``) and csv stems
+    (e.g. ``full_model_all``). If ``fit_history`` is True and *model_name*
+    is not already history-tagged, this returns the corresponding history
+    name/stem when known.
+    """
+    if model_name is None or not fit_history:
+        return model_name
+    if "_history" in str(model_name):
+        return model_name
+
+    cfg = cfg or CONFIG
+    registry = build_model_registry(cfg)
+
+    # Build map for both registry keys and csv stems.
+    mapping = {}
+    for key in registry.keys():
+        hist_key = f"{key}_history"
+        base_stem = os.path.splitext(os.path.basename(model_csv_path(key, cfg=cfg)))[0]
+        hist_stem = os.path.splitext(os.path.basename(model_csv_path(hist_key, cfg=cfg)))[0]
+        mapping[key] = hist_key
+        mapping[base_stem] = hist_stem
+
+    if model_name in mapping:
+        return mapping[model_name]
+
+    # Conservative fallback for unknown names.
+    return f"{model_name}_history"
 
 
 # 1. Data preparation 
@@ -213,22 +248,50 @@ def bin_and_average(values, bin_by, n_bins=50):
     return centers, means
 
 
-def load_model_outputs(model_name, base_dir=None, cfg=None):
+def load_model_outputs(model_name, base_dir=None, cfg=None, fit_history=False):
     """Load CSV diagnostics + NPZ residual profiles for a fitted model.
+
+    Accepts either registry keys (e.g. ``"full_model"``) or csv stems
+    (e.g. ``"full_model_all"``), with or without history resolution.
 
     Returns (diag_df, profiles_dict).
     """
     cfg = cfg or CONFIG
     base_dir = base_dir or cfg["base_dir"]
-    diag = pd.read_csv(
-        f"{base_dir}/analysis/diagnostics_{model_name}.csv", index_col=0
+    resolved = resolve_model_name(model_name, fit_history=fit_history, cfg=cfg)
+    resolved_stem = os.path.splitext(os.path.basename(str(resolved)))[0]
+
+    # Primary diagnostics stem follows model_csv_path(...) naming (e.g. *_model_all).
+    if resolved_stem.endswith("_all"):
+        primary_stem = resolved_stem
+    else:
+        primary_stem = os.path.splitext(
+            os.path.basename(model_csv_path(resolved_stem, base_dir=base_dir, cfg=cfg))
+        )[0]
+
+    # Backward-compatible fallback for older artifacts named without *_all.
+    stems = [primary_stem]
+    if resolved_stem not in stems:
+        stems.append(resolved_stem)
+
+    attempted = []
+    for stem in stems:
+        diag_path = f"{base_dir}/analysis/diagnostics_{stem}.csv"
+        npz_path = f"{base_dir}/analysis/residual_profiles_{stem}.npz"
+        attempted.append((diag_path, npz_path))
+        if os.path.exists(diag_path) and os.path.exists(npz_path):
+            diag = pd.read_csv(diag_path, index_col=0)
+            raw = np.load(npz_path, allow_pickle=True)
+            profiles = {k: raw[k] for k in raw.files}
+            return diag, profiles
+
+    attempts_text = "\n".join(
+        [f"  diagnostics: {d}\n  profiles:    {p}" for d, p in attempted]
     )
-    raw = np.load(
-        f"{base_dir}/analysis/residual_profiles_{model_name}.npz",
-        allow_pickle=True,
+    raise FileNotFoundError(
+        f"Could not find diagnostics/profile outputs for model '{model_name}' "
+        f"(resolved '{resolved_stem}'). Tried:\n{attempts_text}"
     )
-    profiles = {k: raw[k] for k in raw.files}
-    return diag, profiles
 
 
 # 2. GLM fitting 
@@ -241,6 +304,14 @@ def fit_glm_all_units(formula: str,
                       per_unit_transform = None,
                       save_path = None,
                       model_name = None,
+                      fit_history = False,
+                      deep_diagnostics = False,
+                      diagnostics_base_dir = None,
+                      diagnostics_model_name = None,
+                      diagnostics_covariate_cols = None,
+                      diagnostics_categorical_cols = None,
+                      diagnostics_n_bins = 50,
+                      return_diagnostics = False,
                       refit = False):
     """Fit a Poisson GLM for each unit and collect summary statistics.
 
@@ -257,17 +328,91 @@ def fit_glm_all_units(formula: str,
     model_name : str, optional
         Registry key (e.g. ``"speed_spline"``).  If *save_path* is not given,
         the default CSV path is derived via ``model_csv_path(model_name)``.
+    fit_history : bool
+        If True, resolve *model_name* to the history-tagged cache name when
+        deriving/reading the default CSV path (e.g. ``full_model`` →
+        ``full_model_history``).
+    deep_diagnostics : bool
+        If True, compute scalar diagnostics and residual profiles in the same
+        fitting pass and save them to diagnostics/residual_profiles files.
+    diagnostics_base_dir : str, optional
+        Base directory for diagnostics outputs. Defaults to CONFIG["base_dir"].
+    diagnostics_model_name : str, optional
+        Stem used for diagnostics filenames. Defaults to fit CSV stem.
+    diagnostics_covariate_cols : list[str], optional
+        Continuous covariate columns for residual η² and profile panels.
+    diagnostics_categorical_cols : list[str], optional
+        Categorical columns for residual profile panels.
+    diagnostics_n_bins : int
+        Number of bins for continuous residual profiles.
+    return_diagnostics : bool
+        If True and *deep_diagnostics* is enabled, return
+        ``(fit_df, diag_df, profiles_dict)``.
     refit : bool
         If True, always fit even when the cached CSV exists on disk.
     """
-    if save_path is None and model_name is not None:
-        save_path = model_csv_path(model_name)
+    resolved_model_name = resolve_model_name(model_name, fit_history=fit_history, cfg=CONFIG)
+    if save_path is None and resolved_model_name is not None:
+        save_path = model_csv_path(resolved_model_name)
+
+    diag_df = None
+    profiles = None
+    diag_csv_path = None
+    diag_npz_path = None
+    if deep_diagnostics:
+        dbase = diagnostics_base_dir or CONFIG["base_dir"]
+        if diagnostics_model_name is None:
+            if save_path is not None:
+                diag_stem = os.path.splitext(os.path.basename(save_path))[0]
+            else:
+                diag_stem = resolved_model_name if resolved_model_name is not None else "model"
+        else:
+            diag_stem = diagnostics_model_name
+        diag_csv_path = f"{dbase}/analysis/diagnostics_{diag_stem}.csv"
+        diag_npz_path = f"{dbase}/analysis/residual_profiles_{diag_stem}.npz"
+
+    # Cache short-circuit:
+    # - params-only mode: existing fit csv is enough
+    # - deep diagnostics mode: require all artifacts, otherwise refit once
     if save_path and not refit and os.path.exists(save_path):
-        print(f"Loading cached fit from {save_path}")
-        cached = pd.read_csv(save_path, index_col=0)
-        if model_name is not None and "model" not in cached.columns:
-            cached["model"] = model_name
-        return cached
+        if not deep_diagnostics or (diag_csv_path and diag_npz_path and os.path.exists(diag_csv_path) and os.path.exists(diag_npz_path)):
+            print(f"Loading cached fit from {save_path}")
+            cached = pd.read_csv(save_path, index_col=0)
+            if resolved_model_name is not None and "model" not in cached.columns:
+                cached["model"] = resolved_model_name
+            if deep_diagnostics and return_diagnostics:
+                diag_df = pd.read_csv(diag_csv_path, index_col=0)
+                raw_npz = np.load(diag_npz_path, allow_pickle=True)
+                profiles = {k: raw_npz[k] for k in raw_npz.files}
+                return cached, diag_df, profiles
+            return cached
+        print("Fit cache exists but diagnostics cache missing; refitting once to compute diagnostics.")
+
+    # Pre-compute profile binning metadata if deep diagnostics requested.
+    d_cov_cols = diagnostics_covariate_cols or []
+    d_cat_cols = diagnostics_categorical_cols or []
+    bin_edges = {}
+    bin_centers = {}
+    cat_labels = {}
+    if deep_diagnostics:
+        for col in d_cov_cols:
+            if col not in cov_df.columns:
+                continue
+            valid = cov_df[col].dropna().values
+            if len(valid) == 0:
+                continue
+            edges = np.linspace(valid.min(), valid.max(), diagnostics_n_bins + 1)
+            bin_edges[col] = edges
+            bin_centers[col] = (edges[:-1] + edges[1:]) / 2
+        for col in d_cat_cols:
+            if col in cov_df.columns:
+                vals = cov_df[col].dropna().unique()
+                cat_labels[col] = sorted(vals)
+
+    diag_rows = []
+    profile_rows = {col: [] for col in bin_edges}
+    cat_profile_rows = {col: [] for col in cat_labels}
+    valid_prof_ids = []
 
     rows = []
     for i, uid in enumerate(unit_ids):
@@ -291,6 +436,86 @@ def fit_glm_all_units(formula: str,
                 df_model = res.df_model
             ))
 
+            if deep_diagnostics:
+                predicted = np.asarray(res.predict())
+                observed = np.asarray(res.model.endog)
+                raw = observed - predicted
+                n_spikes = int((observed > 0).sum())
+
+                # Cumulative residual drift.
+                cumresid = np.cumsum(raw)
+                drift_auc = np.abs(cumresid).mean() / max(n_spikes, 1)
+
+                # KS D and z autocorrelation.
+                z_unsorted = _compute_z_unsorted(predicted, observed)
+                if len(z_unsorted) >= 4:
+                    z_sorted = np.sort(z_unsorted)
+                    n = len(z_sorted)
+                    ecdf = np.arange(1, n + 1) / n
+                    ks_D = float(np.max(np.abs(ecdf - z_sorted)))
+                    z_autocorr, _ = spearmanr(z_unsorted[:-1], z_unsorted[1:])
+                else:
+                    ks_D, z_autocorr = np.nan, np.nan
+
+                row = dict(
+                    unit=uid, converged=True, ks_D=ks_D,
+                    ks_z_autocorr=float(z_autocorr), drift_auc=drift_auc
+                )
+                ss_total = float(np.sum(raw ** 2))
+
+                # Use aligned covariates corresponding to fitted rows.
+                cov_df_fit = df.drop(columns=["spike_count"]).reset_index(drop=True)
+                if len(cov_df_fit) != len(observed):
+                    cov_df_fit = cov_df_fit.iloc[-len(observed):].reset_index(drop=True)
+
+                # Residual eta2 per continuous covariate.
+                for col in d_cov_cols:
+                    if col not in cov_df_fit.columns:
+                        row[f"resid_eta2_{col}"] = np.nan
+                        continue
+                    valid_mask = ~np.isnan(cov_df_fit[col].values)
+                    if valid_mask.sum() > 10 and ss_total > 0:
+                        cov_vals = cov_df_fit[col].values[valid_mask]
+                        res_vals = raw[valid_mask]
+                        bins = np.linspace(cov_vals.min(), cov_vals.max(), 51)
+                        bin_idx = np.clip(np.digitize(cov_vals, bins) - 1, 0, 49)
+                        ss_between = sum(
+                            (res_vals[bin_idx == b].mean() ** 2) * (bin_idx == b).sum()
+                            for b in range(50) if (bin_idx == b).any()
+                        )
+                        row[f"resid_eta2_{col}"] = float(ss_between / ss_total)
+                    else:
+                        row[f"resid_eta2_{col}"] = np.nan
+
+                diag_rows.append(row)
+
+                # Continuous residual profiles.
+                for col in bin_edges:
+                    if col not in cov_df_fit.columns:
+                        continue
+                    valid_mask = ~np.isnan(cov_df_fit[col].values)
+                    cov_vals = cov_df_fit[col].values[valid_mask]
+                    res_vals = raw[valid_mask]
+                    idx = np.clip(np.digitize(cov_vals, bin_edges[col]) - 1, 0, diagnostics_n_bins - 1)
+                    means = np.array([
+                        res_vals[idx == b].mean() if (idx == b).any() else np.nan
+                        for b in range(diagnostics_n_bins)
+                    ])
+                    profile_rows[col].append(means)
+
+                # Categorical residual profiles.
+                for col in cat_labels:
+                    if col not in cov_df_fit.columns:
+                        continue
+                    cat_vals = cov_df_fit[col].values
+                    means = np.array([
+                        raw[cat_vals == c].mean() if (cat_vals == c).any() else np.nan
+                        for c in cat_labels[col]
+                    ])
+                    cat_profile_rows[col].append(means)
+
+                valid_prof_ids.append(uid)
+
         except Exception as e:
             rows.append(dict(
                 unit=uid, aic=np.nan, llf=np.nan, deviance=np.nan,
@@ -298,13 +523,39 @@ def fit_glm_all_units(formula: str,
                 coef=None, bse=None, deviance_null=np.nan,
                 df_model=np.nan, error=str(e)
             ))
+            if deep_diagnostics:
+                row = dict(unit=uid, converged=False,
+                           ks_D=np.nan, ks_z_autocorr=np.nan, drift_auc=np.nan)
+                for col in d_cov_cols:
+                    row[f"resid_eta2_{col}"] = np.nan
+                diag_rows.append(row)
 
     result = pd.DataFrame(rows)
-    if model_name is not None:
-        result["model"] = model_name
+    if resolved_model_name is not None:
+        result["model"] = resolved_model_name
     if save_path:
         result.to_csv(save_path)
         print(f"Saved {len(result)} units : {save_path}")
+
+    if deep_diagnostics:
+        diag_df = pd.DataFrame(diag_rows)
+        profiles = {"unit_ids": np.array(valid_prof_ids)}
+        for col in bin_edges:
+            profiles[f"{col}_profiles"] = np.array(profile_rows[col])
+            profiles[f"{col}_centers"] = bin_centers[col]
+        for col in cat_labels:
+            profiles[f"{col}_cat_profiles"] = np.array(cat_profile_rows[col])
+            profiles[f"{col}_cat_labels"] = np.array(cat_labels[col], dtype=object)
+
+        if diag_csv_path is not None and diag_npz_path is not None:
+            diag_df.to_csv(diag_csv_path)
+            print(f"Saved → {diag_csv_path}")
+            np.savez(diag_npz_path, **profiles)
+            print(f"Saved → {diag_npz_path}")
+
+        if return_diagnostics:
+            return result, diag_df, profiles
+
     return result
 
 
@@ -359,7 +610,10 @@ def fit_drop_one(model_name: str,
     formula = build_reduced_formula(spec, drop_term)
     drop_term_safe = re.sub(r'[^\w]', '_', drop_term).strip('_')
 
-    res = fit_glm_all_units(formula, spec["cov_df"], spec["spike_counts"], unit_ids)
+    res = fit_glm_all_units(
+        formula, spec["cov_df"], spec["spike_counts"], unit_ids,
+        per_unit_transform=spec.get("per_unit_transform"),
+    )
 
     res["model"] = model_name
     res["dropped_term"] = drop_term
@@ -433,7 +687,8 @@ def _infer_term_df(term):
 
 
 def make_drop_one_specs(datasets, model_names, base_dir=None,
-                        registry=None, cfg=None):
+                        registry=None, cfg=None,
+                        fit_history=False, history_windows_ms=None):
     """Build drop-one specs from the model registry.
 
     Parameters
@@ -451,26 +706,35 @@ def make_drop_one_specs(datasets, model_names, base_dir=None,
     if registry is None:
         registry = build_model_registry(cfg)
 
-    null_csv = {
-        "common":   f"{base_dir}/analysis/null_model_all.csv",
-        "outbound": f"{base_dir}/analysis/null_model_out_all.csv",
-    }
+    history_transform = make_history_transform(
+        windows_ms=history_windows_ms, bin_size=cfg["bin_size"]
+    ) if fit_history else None
+
+    def _run_name(name):
+        return f"{name}_history" if fit_history else name
 
     specs = {}
     for name in model_names:
         entry = registry[name]
+        run_name = _run_name(name)
         formula = entry["formula"]
+        if fit_history:
+            formula = make_history_formula(formula, windows_ms=history_windows_ms)
         ds_key  = entry["dataset"]
         terms   = _parse_formula_terms(formula)
 
         cov_df, spike_counts = datasets[ds_key]
-        specs[f"{name}_all"] = {
+        model_stem = os.path.splitext(os.path.basename(model_csv_path(run_name, base_dir=base_dir, cfg=cfg)))[0]
+        null_run_name = _run_name("null" if ds_key == "common" else "null_outbound")
+        specs[model_stem] = {
             "formula_lhs": formula.split("~")[0].strip(),
             "terms": terms,
             "delta_df": {t: _infer_term_df(t) for t in terms},
             "cov_df": cov_df,
             "spike_counts": spike_counts,
-            "null_csv": null_csv[ds_key],
+            "null_csv": model_csv_path(null_run_name, base_dir=base_dir, cfg=cfg),
+            "per_unit_transform": history_transform,
+            "fit_history": bool(fit_history),
         }
 
     return specs
@@ -756,6 +1020,37 @@ DEFAULT_PANELS = {
     "choice":          "categorical",
 }
 
+DEFAULT_HISTORY_WINDOWS_MS = ((0, 2), (2, 10), (10, 20), (20, 50))
+
+
+def history_term_names(windows_ms=None):
+    """Return history covariate column names for the provided windows."""
+    windows_ms = windows_ms or DEFAULT_HISTORY_WINDOWS_MS
+    return [f"hist_{lo}_{hi}ms" for lo, hi in windows_ms]
+
+
+def make_history_formula(formula, windows_ms=None):
+    """Return formula augmented with history terms (if not already present)."""
+    windows_ms = windows_ms or DEFAULT_HISTORY_WINDOWS_MS
+    terms = history_term_names(windows_ms)
+    lhs, rhs = formula.split("~", 1)
+    rhs = rhs.strip()
+    extras = []
+    for term in terms:
+        pat = rf"(?<![A-Za-z0-9_]){re.escape(term)}(?![A-Za-z0-9_])"
+        if re.search(pat, rhs) is None:
+            extras.append(term)
+    if extras:
+        rhs = rhs + " + " + " + ".join(extras)
+    return f"{lhs.strip()} ~ {rhs}"
+
+
+def make_history_transform(windows_ms=None, bin_size=None):
+    """Return per-unit transform callback that injects spike-history covariates."""
+    windows_ms = windows_ms or DEFAULT_HISTORY_WINDOWS_MS
+    bin_size = CONFIG["bin_size"] if bin_size is None else bin_size
+    return partial(add_spike_history, windows_ms=windows_ms, bin_size=bin_size)
+
 
 def plot_residuals(residuals_df, n_bins=50, title="",
                    show_cumulative=False, panels=None):
@@ -980,6 +1275,187 @@ def plot_ks(z_vals, alpha=0.05, ax=None, title = None):
         plt.tight_layout()
 
 
+def _simulate_autoregressive(results, windows_ms=None, bin_size=0.002, n_sim=20, rng=None,
+                             return_runs=False):
+    """Simulate spike trains forward from a history GLM's own predictions.
+
+    At each bin, non-history covariate drive comes from the fitted model design
+    matrix (results.model.exog), while history covariates are recomputed from
+    simulated (not observed) spikes. This keeps simulation compatible with
+    null, single-variable, history-only, and full models.
+
+    Uses a running cumulative sum so each window sum is O(1) per step,
+    mirroring the cumsum trick in add_spike_history.
+
+    History windows are inferred from coefficient names matching:
+      hist_<lo_ms>_<hi_ms>ms
+    The windows_ms argument is retained only for backward compatibility.
+    """
+    if rng is None:
+        rng = np.random.default_rng(0)
+
+    n_bins = int(results.nobs)
+    exog = np.asarray(results.model.exog, dtype=float)
+    exog_names = list(results.model.exog_names)
+
+    # Align coefficient vector to model exog columns (works for null/history/full).
+    params_raw = results.params
+    if isinstance(params_raw, pd.Series):
+        coef_series = params_raw.reindex(exog_names).fillna(0.0)
+    else:
+        coef_series = pd.Series(np.asarray(params_raw, dtype=float), index=exog_names)
+    coefs = coef_series.to_numpy(dtype=float)
+
+    # History terms are dynamic and must be recomputed from simulated spikes.
+    # Non-history terms (position, speed, trial type, splines, intercept, etc.)
+    # are taken directly from each fitted exog row.
+    bsms = bin_size * 1000.0
+    hist_mask = np.zeros(len(exog_names), dtype=bool)
+    hist_terms = []
+    hist_pattern = re.compile(r"^hist_(\d+(?:\.\d+)?)_(\d+(?:\.\d+)?)ms$")
+    for i, (name, coef) in enumerate(zip(exog_names, coefs)):
+        m = hist_pattern.match(name)
+        if m is None:
+            continue
+        lo_ms = float(m.group(1))
+        hi_ms = float(m.group(2))
+        lo_b = int(round(lo_ms / bsms))
+        hi_b = int(round(hi_ms / bsms))
+        hist_mask[i] = True
+        hist_terms.append((lo_b, hi_b, float(coef)))
+
+    max_lag = max((hi for _, hi, _ in hist_terms), default=0)
+    coefs_nonhist = coefs.copy()
+    coefs_nonhist[hist_mask] = 0.0
+    lp_nonhist = exog @ coefs_nonhist
+
+    sim_isis_all = []
+    run_data = []
+    for _ in range(n_sim):
+        cs     = np.zeros(n_bins + 1)  # cs[t] = total simulated spikes in [0, t)
+        spikes = np.zeros(n_bins)
+
+        for t in range(max_lag, n_bins):
+            if t > 0:
+                cs[t] = cs[t - 1] + spikes[t - 1]
+            lp = lp_nonhist[t]
+            for lo_b, hi_b, coef in hist_terms:
+                end = t if lo_b == 0 else t - lo_b
+                lp += coef * (cs[end] - cs[t - hi_b])
+            spikes[t] = rng.poisson(np.exp(min(lp, 5.0)))
+
+        idx = np.where(spikes > 0)[0]
+        run_isis = np.array([])
+        if len(idx) > 1:
+            run_isis = np.diff(idx) * bin_size * 1000
+            sim_isis_all.extend(run_isis)
+
+        if return_runs:
+            run_data.append((spikes, run_isis))
+
+    if return_runs:
+        return run_data
+    return np.array(sim_isis_all)
+
+
+def plot_predicted_isi(results, windows_ms=None, bin_size=None, max_isi_ms=200,
+                       n_bins=40, n_sim=20, ax=None, title=None,
+                       occ_floor=0.05, occ_factor=6.0,
+                       rate_floor_hz=30.0, rate_factor=6.0,
+                       max_count=15):
+    """
+    Plot observed vs predicted ISI distribution for a fitted Poisson GLM.
+
+    Observed ISIs are derived from the model's endog (spike counts per bin).
+    Predicted ISIs are estimated by conditional autoregressive simulation:
+    non-history terms use the fitted design-matrix drive at each bin, while
+    history covariates are recomputed from the simulated spike train so that
+    post-spike dynamics (refractoriness, facilitation) propagate correctly.
+
+    Parameters
+    ----------
+    results    : fitted statsmodels GLM result (Poisson)
+    windows_ms : optional legacy arg (kept for backward compatibility).
+                 History columns are inferred from fitted coefficient names
+                 matching hist_<lo>_<hi>ms.
+    bin_size   : bin width in seconds (default: CONFIG["bin_size"])
+    max_isi_ms : upper limit of the histogram range in ms
+    n_bins     : number of histogram bins
+    n_sim      : number of simulated spike trains pooled for the prediction
+    ax         : matplotlib Axes; creates a new figure if None
+    title      : plot title
+    occ_floor  : minimum occupied-bin threshold for rejecting unstable runs
+    occ_factor : reject if sim occupied-bin fraction > occ_factor * observed
+    rate_floor_hz : minimum firing-rate threshold (Hz) for rejection
+    rate_factor   : reject if simulated mean rate > rate_factor * observed
+    max_count  : reject if max simulated count in any bin exceeds this value
+    """
+    bin_size = bin_size or CONFIG["bin_size"]
+    rng = np.random.default_rng(0)
+
+    observed = np.asarray(results.model.endog, dtype=int)
+    spike_idx = np.where(observed > 0)[0]
+    observed_isis_ms = np.diff(spike_idx) * bin_size * 1000
+
+    obs_occ = float((observed > 0).mean())
+    obs_rate_hz = float(observed.mean() / bin_size)
+    occ_cut = max(occ_floor, occ_factor * obs_occ)
+    rate_cut_hz = max(rate_floor_hz, rate_factor * obs_rate_hz)
+
+    run_data = _simulate_autoregressive(
+        results, windows_ms, bin_size, n_sim, rng, return_runs=True
+    )
+    accepted_isis = []
+    n_rejected = 0
+    for spikes, run_isis in run_data:
+        sim_occ = float((spikes > 0).mean())
+        sim_rate_hz = float(spikes.mean() / bin_size)
+        sim_max = float(spikes.max()) if len(spikes) else 0.0
+
+        explode = (
+            (sim_occ > occ_cut)
+            or (sim_rate_hz > rate_cut_hz)
+            or (sim_max > max_count)
+        )
+        if explode:
+            n_rejected += 1
+            continue
+        if run_isis.size:
+            accepted_isis.append(run_isis)
+
+    sim_isis_ms = np.concatenate(accepted_isis) if accepted_isis else np.array([])
+    n_kept = n_sim - n_rejected
+
+    standalone = ax is None
+    if standalone:
+        fig, ax = plt.subplots(figsize=(6, 4))
+
+    bins = np.linspace(0, max_isi_ms, n_bins + 1)
+    obs_clipped = observed_isis_ms[observed_isis_ms <= max_isi_ms]
+    sim_clipped = sim_isis_ms[sim_isis_ms <= max_isi_ms]
+
+    ax.hist(obs_clipped, bins=bins, density=True, alpha=0.6,
+            color="steelblue", label="Observed")
+    pred_label = f"Predicted (kept {n_kept}/{n_sim})"
+    if sim_clipped.size:
+        ax.hist(sim_clipped, bins=bins, density=True, histtype="step",
+                color="tomato", lw=2, label=pred_label)
+    else:
+        ax.plot([], [], color="tomato", lw=2, label=pred_label)
+        ax.text(0.5, 0.85, "No accepted simulated ISIs",
+                ha="center", va="center", transform=ax.transAxes,
+                color="tomato", fontsize=9)
+
+    ax.set_xlabel("ISI (ms)")
+    ax.set_ylabel("Density")
+    ax.set_title(title or "ISI distribution: observed vs predicted")
+    ax.legend(fontsize=9)
+    sns.despine(ax=ax)
+
+    if standalone:
+        plt.tight_layout()
+
+
 def plot_diagnostics_batch(unit_list, formula, cov_df, spike_counts_masked, unit_ids,
                            panels=None, n_bins=50, alpha=0.05, show_cumulative=False):
     """
@@ -1179,7 +1655,8 @@ def plot_diagnostics(results, spike_counts=None, cov_df=None,
 
 def compute_model_diagnostics(formula, cov_df, spike_counts_masked, unit_ids,
                                covariate_cols, base_dir, model_name,
-                               n_bins=50, unit_subset=None, categorical_cols=None):
+                               n_bins=50, unit_subset=None, categorical_cols=None,
+                               per_unit_transform=None):
     """
     Fit GLM once per unit and compute both scalar diagnostics and residual profiles.
 
@@ -1244,6 +1721,8 @@ def compute_model_diagnostics(formula, cov_df, spike_counts_masked, unit_ids,
         uid = unit_ids_arr[i]
         df  = cov_df.copy()
         df["spike_count"] = spike_counts_masked[i]
+        if per_unit_transform is not None:
+            df = per_unit_transform(df, spike_counts_masked[i], i)
 
         try:
             res = smf.glm(formula, data=df,
@@ -1346,12 +1825,13 @@ def compute_model_diagnostics(formula, cov_df, spike_counts_masked, unit_ids,
 
 def compute_diagnostics_all_units(formula, cov_df, spike_counts_masked, unit_ids,
                                    covariate_cols, base_dir, model_name,
-                                   unit_subset=None):
+                                   unit_subset=None, per_unit_transform=None):
     """Thin wrapper — calls compute_model_diagnostics and returns only diag_df."""
     diag_df, _ = compute_model_diagnostics(
         formula, cov_df, spike_counts_masked, unit_ids,
         covariate_cols, base_dir, model_name,
         unit_subset=unit_subset,
+        per_unit_transform=per_unit_transform,
     )
     return diag_df
 
@@ -1581,10 +2061,17 @@ def plot_residual_profiles(profiles_dicts, covariate_cols=None):
     if not isinstance(profiles_dicts, dict) or "unit_ids" in profiles_dicts:
         profiles_dicts = {"model": profiles_dicts}
 
+    first = next(iter(profiles_dicts.values()))
+    detected = {}
+    for key in first:
+        if key.endswith("_cat_profiles"):
+            detected[key.replace("_cat_profiles", "")] = "categorical"
+        elif key.endswith("_profiles"):
+            detected[key.replace("_profiles", "")] = "continuous"
+
     if covariate_cols is None:
-        first = next(iter(profiles_dicts.values()))
-        covariate_cols = [k.replace("_profiles", "")
-                          for k in first if k.endswith("_profiles")]
+        covariate_cols = list(detected.keys())
+    panel_kind = {col: detected.get(col, "continuous") for col in covariate_cols}
 
     model_order = list(profiles_dicts.keys())
     palette     = sns.color_palette("tab10", len(model_order))
@@ -1600,18 +2087,42 @@ def plot_residual_profiles(profiles_dicts, covariate_cols=None):
 
         for label, color in zip(model_order, palette):
             prof  = profiles_dicts[label]
-            mat   = prof[f"{col}_profiles"]   # (n_units, n_bins)
-            cents = prof[f"{col}_centers"]    # (n_bins,)
-
-            if mat.shape[0] == 0:
-                continue
-            mean_prof = np.nanmean(mat, axis=0)
-            sem_prof  = np.nanstd(mat, axis=0) / np.sqrt(mat.shape[0])
-            ax.plot(cents, mean_prof, color=color, lw=1.5, label=label)
-            ax.fill_between(cents,
-                            mean_prof - sem_prof,
-                            mean_prof + sem_prof,
-                            color=color, alpha=0.25)
+            kind = panel_kind[col]
+            if kind == "categorical":
+                prof_key = f"{col}_cat_profiles"
+                lab_key = f"{col}_cat_labels"
+                if prof_key not in prof or lab_key not in prof:
+                    continue
+                mat = np.asarray(prof[prof_key])
+                labels = list(prof[lab_key])
+                if mat.shape[0] == 0:
+                    continue
+                mean_prof = np.nanmean(mat, axis=0)
+                sem_prof = np.nanstd(mat, axis=0) / np.sqrt(mat.shape[0])
+                x = np.arange(len(labels))
+                ax.plot(x, mean_prof, color=color, lw=1.5, label=label)
+                ax.fill_between(x,
+                                mean_prof - sem_prof,
+                                mean_prof + sem_prof,
+                                color=color, alpha=0.25)
+                ax.set_xticks(x)
+                ax.set_xticklabels(labels)
+            else:
+                prof_key = f"{col}_profiles"
+                cent_key = f"{col}_centers"
+                if prof_key not in prof or cent_key not in prof:
+                    continue
+                mat = np.asarray(prof[prof_key])   # (n_units, n_bins)
+                cents = np.asarray(prof[cent_key]) # (n_bins,)
+                if mat.shape[0] == 0:
+                    continue
+                mean_prof = np.nanmean(mat, axis=0)
+                sem_prof  = np.nanstd(mat, axis=0) / np.sqrt(mat.shape[0])
+                ax.plot(cents, mean_prof, color=color, lw=1.5, label=label)
+                ax.fill_between(cents,
+                                mean_prof - sem_prof,
+                                mean_prof + sem_prof,
+                                color=color, alpha=0.25)
 
         ax.set_xlabel(col)
         ax.set_ylabel("Mean residual (spikes/bin)")
@@ -1744,6 +2255,148 @@ def plot_residual_rms(profiles_dicts, covariate_cols=None):
 
     fig.suptitle("Per-unit RMS of binned residual profiles", fontsize=13)
     return fig
+
+
+def plot_residual_rms_pair_profiles(prof_a, prof_b,
+                                    label_a="model A", label_b="model B",
+                                    covariate_cols=None):
+    """
+    Pairwise scatter of per-unit residual-profile RMS for two models.
+
+    For each shared unit and covariate, computes:
+        RMS = sqrt(mean(profile^2)) over profile bins
+
+    Parameters
+    ----------
+    prof_a, prof_b : dict
+        Profile dicts as returned by ``compute_model_diagnostics`` /
+        ``load_model_outputs`` (must include ``unit_ids``).
+    label_a, label_b : str
+        Axis labels for model A/B.
+    covariate_cols : list[str], optional
+        Covariates to plot (continuous and/or categorical). If None, defaults
+        to ``linear_position, speed, trial_type`` (only those three), filtered
+        to whichever are present in both profile dicts.
+
+    Returns
+    -------
+    fig, axes, shared_unit_ids
+    """
+    def _continuous_covariates(prof):
+        return {
+            k.replace("_profiles", "")
+            for k in prof.keys()
+            if k.endswith("_profiles") and not k.endswith("_cat_profiles")
+        }
+
+    def _categorical_covariates(prof):
+        return {
+            k.replace("_cat_profiles", "")
+            for k in prof.keys()
+            if k.endswith("_cat_profiles")
+        }
+
+    shared_cont = _continuous_covariates(prof_a) & _continuous_covariates(prof_b)
+    shared_cat  = _categorical_covariates(prof_a) & _categorical_covariates(prof_b)
+    shared_any  = shared_cont | shared_cat
+
+    if covariate_cols is None:
+        preferred_order = ["linear_position", "speed", "trial_type"]
+        covariate_cols = [c for c in preferred_order if c in shared_any]
+    else:
+        covariate_cols = [c for c in covariate_cols if c in shared_any]
+
+    if len(covariate_cols) == 0:
+        raise ValueError("No shared residual-profile covariates found.")
+
+    ids_a = np.asarray(prof_a["unit_ids"])
+    ids_b = np.asarray(prof_b["unit_ids"])
+    shared, idx_a, idx_b = np.intersect1d(ids_a, ids_b, return_indices=True)
+    if len(shared) == 0:
+        raise ValueError("No shared unit_ids between profile dicts.")
+
+    n_covs = len(covariate_cols)
+    fig, axes = plt.subplots(1, n_covs, figsize=(4.5 * n_covs, 4.5),
+                             constrained_layout=True)
+    axes = np.atleast_1d(axes)
+
+    for ax, col in zip(axes, covariate_cols):
+        if col in shared_cont:
+            key = f"{col}_profiles"
+        else:
+            key = f"{col}_cat_profiles"
+
+        mat_a = np.asarray(prof_a[key], dtype=float)[idx_a]
+        mat_b = np.asarray(prof_b[key], dtype=float)[idx_b]
+        rms_a = np.sqrt(np.nanmean(mat_a ** 2, axis=1))
+        rms_b = np.sqrt(np.nanmean(mat_b ** 2, axis=1))
+
+        finite_max = np.nanmax(np.r_[rms_a, rms_b])
+        lim = 1.0 if not np.isfinite(finite_max) else max(1e-9, finite_max) * 1.1
+
+        ax.scatter(rms_a, rms_b, s=12, alpha=0.5, color="steelblue")
+        ax.plot([0, lim], [0, lim], color="red", lw=1, ls="--", label="no change")
+        ax.set_xlim(0, lim)
+        ax.set_ylim(0, lim)
+        ax.set_xlabel(f"{label_a} RMS (spikes/bin)")
+        ax.set_ylabel(f"{label_b} RMS (spikes/bin)")
+        ax.set_title(col)
+        ax.legend(fontsize=8)
+        sns.despine(ax=ax)
+
+    fig.suptitle(
+        f"Per-neuron RMS of binned residual profiles: {label_a} vs {label_b} "
+        f"(n={len(shared)} units)",
+        fontsize=12,
+    )
+    return fig, axes, shared
+
+
+def plot_residual_rms_pair_models(model_a, model_b,
+                                  label_a=None, label_b=None,
+                                  base_dir=None, cfg=None,
+                                  fit_history_a=False, fit_history_b=False,
+                                  covariate_cols=None):
+    """
+    Convenience wrapper: load profile outputs by model name and make pairwise RMS scatter.
+
+    Parameters
+    ----------
+    model_a, model_b : str
+        Model keys/stems accepted by ``load_model_outputs``.
+    label_a, label_b : str, optional
+        Display labels for axes. Defaults to resolved model names.
+    base_dir, cfg : optional
+        Forwarded to ``load_model_outputs``.
+    fit_history_a, fit_history_b : bool
+        If True, resolve each model to its ``*_history`` counterpart.
+    covariate_cols : list[str], optional
+        Forwarded to ``plot_residual_rms_pair_profiles``.
+
+    Returns
+    -------
+    fig, axes, shared_unit_ids
+    """
+    cfg = cfg or CONFIG
+    resolved_a = resolve_model_name(model_a, fit_history=fit_history_a, cfg=cfg)
+    resolved_b = resolve_model_name(model_b, fit_history=fit_history_b, cfg=cfg)
+
+    _, prof_a = load_model_outputs(
+        model_a, base_dir=base_dir, cfg=cfg, fit_history=fit_history_a
+    )
+    _, prof_b = load_model_outputs(
+        model_b, base_dir=base_dir, cfg=cfg, fit_history=fit_history_b
+    )
+
+    label_a = resolved_a if label_a is None else label_a
+    label_b = resolved_b if label_b is None else label_b
+    return plot_residual_rms_pair_profiles(
+        prof_a=prof_a,
+        prof_b=prof_b,
+        label_a=label_a,
+        label_b=label_b,
+        covariate_cols=covariate_cols,
+    )
 
 
 # 5. Visualization 
