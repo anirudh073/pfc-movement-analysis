@@ -2584,19 +2584,22 @@ def compute_marginal_effect(results, term_pattern, sweep_values,
     other_cols = [i for i in range(len(col_names)) if i not in term_cols]
     eta_other = X_fit[:, other_cols] @ params[other_cols]
 
-    # Build sweep design matrix using the model's own design_info
+    # Build sweep design matrix using the model's own design_info.
+    # Use results.model.data.frame as the source so that unit-specific columns
+    # injected by per_unit_transform (e.g. spike-history covariates) are present.
     design_info = results.model.data.orig_exog.design_info
     n_sweep = len(sweep_values)
-    sweep_df = cov_df.iloc[:n_sweep].copy()
+    fit_frame = results.model.data.frame
+    sweep_df = fit_frame.iloc[:n_sweep].copy()
     sweep_df[sweep_col] = np.asarray(sweep_values)[:len(sweep_df)]
     # Fill non-swept columns with neutral values so patsy can evaluate
-    for col in cov_df.columns:
+    for col in fit_frame.columns:
         if col == sweep_col or col == "spike_count":
             continue
-        if pd.api.types.is_numeric_dtype(cov_df[col]):
-            sweep_df[col] = cov_df[col].median()
+        if pd.api.types.is_numeric_dtype(fit_frame[col]):
+            sweep_df[col] = fit_frame[col].median()
         else:
-            sweep_df[col] = cov_df[col].mode().iloc[0]
+            sweep_df[col] = fit_frame[col].mode().iloc[0]
 
     X_sweep = np.asarray(
         _patsy.build_design_matrices([design_info], sweep_df,
