@@ -165,11 +165,24 @@ def load_and_prepare_data(cfg=None):
     )
 
     # interpolate covariates to 2ms bins
+    skip_cols = {"video_frame_ind"}
+    ffill_cols = {
+        "track_segment_id", "trial_number", "trial_start", "trial_end",
+        "trial_duration (s)", "trial_type", "left/right", "epoch",
+    }
     cols_to_interp = [c for c in trialized_position.columns
-                      if c != "video_frame_ind"]
+                      if c not in skip_cols]
     times = trialized_position.index.astype(float).values
-    interpolated = {col: interp_col(trialized_position[col], times, bin_centers)
-                    for col in cols_to_interp}
+
+    def _interp(col_name):
+        col_values = trialized_position[col_name]
+        if col_name in ffill_cols:
+            # forward-fill for categorical columns stored as int
+            idx = (np.searchsorted(times, bin_centers, side='right') - 1).clip(0, len(times) - 1)
+            return col_values.iloc[idx].values
+        return interp_col(col_values, times, bin_centers)
+
+    interpolated = {col: _interp(col) for col in cols_to_interp}
     interp_pos = pd.DataFrame(interpolated, columns=cols_to_interp)
     interp_pos.insert(0, "time_bin_center", bin_centers)
 
