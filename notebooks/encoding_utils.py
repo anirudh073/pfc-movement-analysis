@@ -31,14 +31,14 @@ sns.set_context("talk")
 # 0. Configuration 
 
 CONFIG = dict(
-    bin_size      = 0.002,
+    bin_size      = 0.002, #ms
     speed_min     = 5,
     speed_max     = 120,
     speed_df      = 4, #degrees of freedom
     pos_df        = 8,
     tp_df         = 6, #trial progress
     base_dir      = "/media/labuser/NA_1_2025/spyglass/wilbur",
-    wtrack_name   = "Wtrack_wilbur20210512",
+    wtrack_name   = "Wtrack_center0_wilbur20210512",
 )
 
 
