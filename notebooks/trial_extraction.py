@@ -230,11 +230,59 @@ def prepare_trial_data(lick_events_dataframe: pd.DataFrame):
 
 #     return merged_dataframe
 
+def compute_distance_gap_aware(linear_position, track_segment_id,
+                               edge_spacing, segment_order):
+    """Cumulative distance along linearized position, subtracting trackgraph gaps.
+
+    When the animal crosses from one edge to another, the linearized coordinate
+    jumps by the artificial gap inserted via ``edge_spacing``.  This function
+    detects those transitions using ``track_segment_id`` and removes the gap
+    from the distance increment so that only real movement is counted.
+
+    Parameters
+    ----------
+    linear_position : np.ndarray
+        1-D array of linearized position values.
+    track_segment_id : np.ndarray
+        1-D array (same length) of integer edge/segment indices.
+    edge_spacing : list of float
+        Gap between consecutive edges in 1-D order, length = n_edges - 1.
+        e.g. [0, 10, 10, 0] for a 5-edge W-track with center0.
+    segment_order : list of int
+        track_segment_id values in their left-to-right 1-D order.
+        e.g. [3, 1, 0, 2, 4] for the Wtrack_center0 trackgraph.
+        Must have len(segment_order) == len(edge_spacing) + 1.
+
+    Returns
+    -------
+    np.ndarray  — cumulative distance with gaps removed.
+    """
+    pos = np.asarray(linear_position, dtype=float)
+    seg = np.asarray(track_segment_id, dtype=int)
+    spacing = np.asarray(edge_spacing, dtype=float)
+
+    # Build cumulative gap indexed by track_segment_id
+    cum_vals = np.concatenate(([0.0], np.cumsum(spacing)))
+    cum_by_seg = {int(sid): cum_vals[i] for i, sid in enumerate(segment_order)}
+
+    raw_diff = np.abs(np.diff(pos, prepend=pos[0]))
+
+    # At every segment transition, subtract the accumulated gap
+    seg_change = np.diff(seg, prepend=seg[0])
+    for j in np.nonzero(seg_change != 0)[0]:
+        a, b = int(seg[j - 1]), int(seg[j])
+        gap = abs(cum_by_seg.get(b, 0.0) - cum_by_seg.get(a, 0.0))
+        if gap > 0:
+            raw_diff[j] = max(0.0, raw_diff[j] - gap)
+
+    return np.cumsum(raw_diff)
+
+
 def merge_trial_df_with_target(target_dataframe, trials_dataframe, reward_ranges = (
     (0, 25),
-    (260, 285),
-    (431, 456)
-)):
+    (315, 340),
+    (522, 547)
+), edge_spacing=None, segment_order=None):
     """ merge a trial dataframe with a target (containing 2D or linearized position data)
         target_dataframe must share timestamps with trials_dataframe
 
@@ -242,6 +290,11 @@ def merge_trial_df_with_target(target_dataframe, trials_dataframe, reward_ranges
         position_dataframe (pd.DataFrame): Indexed by time in UNIX format
         trials_dataframe (pd.DataFrame): Output of prepare_trial_data()
         reward_ranges (list of tuples): tuples representing reward zone ranges in terms of linear positons
+        edge_spacing (list of float or None): gap sizes between consecutive edges in 1-D
+            order (e.g. [0, 10, 10, 0]).  Required together with ``segment_order``.
+        segment_order (list of int or None): track_segment_id values in their
+            left-to-right 1-D order (e.g. [3, 1, 0, 2, 4] for Wtrack_center0).
+            Required together with ``edge_spacing``.
     """
     
     trials_sorted = trials_dataframe.sort_values("trial_start")
@@ -266,10 +319,31 @@ def merge_trial_df_with_target(target_dataframe, trials_dataframe, reward_ranges
     merged_dataframe["trial_progress"] = merged_dataframe["time_since_trial_start"]/merged_dataframe["trial_duration (s)"]
     merged_dataframe = merged_dataframe.drop("time_since_trial_start", axis = 1)
     
-    merged_dataframe["distance_increment"] = merged_dataframe.groupby("trial_number")["linear_position"].diff().fillna(0).abs()
-    merged_dataframe["distance_since_trial_start"] = merged_dataframe.groupby("trial_number")["distance_increment"].cumsum()
-    merged_dataframe["trial_progress_distance"] = merged_dataframe["distance_since_trial_start"] / merged_dataframe.groupby("trial_number")["distance_since_trial_start"].transform("max").replace(0, np.nan)
-    merged_dataframe = merged_dataframe.drop(["distance_increment", "distance_since_trial_start"], axis = 1)
+    use_gap_aware = (edge_spacing is not None
+                     and segment_order is not None
+                     and "track_segment_id" in merged_dataframe.columns)
+
+    if use_gap_aware:
+        merged_dataframe["distance_since_trial_start"] = (
+            merged_dataframe.groupby("trial_number", group_keys=False)
+            .apply(lambda g: pd.Series(
+                compute_distance_gap_aware(
+                    g["linear_position"].values,
+                    g["track_segment_id"].values,
+                    edge_spacing,
+                    segment_order),
+                index=g.index))
+        )
+    else:
+        distance_increment = merged_dataframe.groupby("trial_number")["linear_position"].diff().fillna(0).abs()
+        merged_dataframe["distance_since_trial_start"] = distance_increment.groupby(merged_dataframe["trial_number"]).cumsum()
+
+    merged_dataframe["trial_progress_distance"] = (
+        merged_dataframe["distance_since_trial_start"]
+        / merged_dataframe.groupby("trial_number")["distance_since_trial_start"]
+          .transform("max").replace(0, np.nan)
+    )
+    merged_dataframe = merged_dataframe.drop("distance_since_trial_start", axis=1)
     
 
     in_reward_range = False
