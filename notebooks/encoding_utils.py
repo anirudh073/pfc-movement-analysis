@@ -14,17 +14,20 @@ Sections:
   5. Visualization     : set_plot_state, plot_place_field, plot_place_field_grid
 """
 
-import os, re
+import ast
+import os, re, warnings
 from functools import partial
 import numpy as np
 import pandas as pd
 import statsmodels.api as sm
 import statsmodels.formula.api as smf
 from scipy.stats import chi2, wilcoxon, spearmanr
+from scipy.ndimage import gaussian_filter1d
 import matplotlib.pyplot as plt
 import seaborn as sns
 from statsmodels.stats.multitest import multipletests
 import itertools
+from collections import Counter 
 sns.set_context("talk")
 
 
@@ -36,10 +39,31 @@ CONFIG = dict(
     speed_max     = 120,
     speed_df      = 4, #degrees of freedom
     pos_df        = 8,
+    branch_pos_df = 4,
     tp_df         = 6, #trial progress
     base_dir      = "/media/labuser/NA_1_2025/spyglass/wilbur",
     wtrack_name   = "Wtrack_center0_wilbur20210512",
+    trialized_position = "/media/labuser/NA_1_2025/spyglass/wilbur/analysis/position/trialized_position_center0.csv"
 )
+
+
+BRANCH_SPECS = {
+    "top": {
+        "segments": (1, 3),
+        "origin_segment": 1,
+        "direction": -1.0,
+    },
+    "middle": {
+        "segments": (0,),
+        "origin_segment": 0,
+        "direction": 1.0,
+    },
+    "bottom": {
+        "segments": (2, 4),
+        "origin_segment": 2,
+        "direction": 1.0,
+    },
+}
 
 
 def build_model_registry(cfg=None):
@@ -51,6 +75,9 @@ def build_model_registry(cfg=None):
     cfg = cfg or CONFIG
     spd = f"bs(speed_scaled, df={cfg['speed_df']})"
     pos = f"bs(pos_scaled, df={cfg['pos_df']})"
+    branch_pos = (
+        f"C(branch_id) + bs(branch_pos_scaled, df={cfg['branch_pos_df']}):C(branch_id)"
+    )
     tp  = f"cr(trial_progress, df={cfg['tp_df']}, constraints='center')"
 
     return {
@@ -60,12 +87,53 @@ def build_model_registry(cfg=None):
         "choice":                  {"formula": "spike_count ~ choice",                        "dataset": "outbound"},
         "speed_spline":            {"formula": f"spike_count ~ {spd}",                        "dataset": "common"},
         "pos_spline":              {"formula": f"spike_count ~ {pos}",                        "dataset": "common"},
+        "branch_pos_spline":       {"formula": f"spike_count ~ {branch_pos}",                 "dataset": "common"},
         "trial_progress_spline":   {"formula": f"spike_count ~ {tp}",                         "dataset": "common"},
-        "full_model":              {"formula": f"spike_count ~ trial_type + {pos} + {spd}",   "dataset": "common"},
+        "full_model":              {"formula": f"spike_count ~ trial_type + {branch_pos} + {spd}",   "dataset": "common"},
         "temporal_model":          {"formula": f"spike_count ~ trial_type + {tp} + {spd}",    "dataset": "common"},
         "choice_full_model":       {"formula": f"spike_count ~ choice + {pos} + {spd}",       "dataset": "outbound"},
         "choice_temporal_model":   {"formula": f"spike_count ~ choice + {tp} + {spd}",        "dataset": "outbound"},
     }
+
+
+def _result_converged(res):
+    """Return a robust convergence flag across IRLS and optimizer-based fits."""
+    converged = getattr(res, "converged", None)
+    if converged is not None:
+        return bool(converged)
+    mle_retvals = getattr(res, "mle_retvals", None)
+    if isinstance(mle_retvals, dict) and "converged" in mle_retvals:
+        return bool(mle_retvals["converged"])
+    return True
+
+
+def _result_is_finite(res):
+    """Return True only for numerically valid fitted results."""
+    params = np.asarray(getattr(res, "params", []), dtype=float)
+    llf = getattr(res, "llf", np.nan)
+    deviance = getattr(res, "deviance", np.nan)
+    return (
+        np.isfinite(params).all()
+        and np.isfinite(llf)
+        and np.isfinite(deviance)
+    )
+
+
+def _fit_glm_with_fallback(formula, data, family=None):
+    """Fit a GLM strictly with IRLS and reject numerically bad results."""
+    family = family or sm.families.Poisson()
+    model = smf.glm(formula, data=data, family=family)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)
+        res = model.fit(disp=False)
+
+    if not _result_converged(res):
+        raise RuntimeError("IRLS did not converge")
+    if not _result_is_finite(res):
+        raise RuntimeError("IRLS returned a non-finite result")
+
+    res._codex_fit_method = "irls"
+    return res
 
 
 def model_csv_path(registry_key, base_dir=None, cfg=None):
@@ -134,6 +202,68 @@ def interp_col(col_values, times, bin_centers):
         return col_values.iloc[idx].values
 
 
+def _segment_position_bounds(position_df):
+    """Return per-segment linear-position bounds from the source position table."""
+    seg_bounds = (
+        position_df.groupby("track_segment_id")["linear_position"]
+        .agg(["min", "max"])
+        .to_dict("index")
+    )
+    return {int(seg): {"min": vals["min"], "max": vals["max"]} for seg, vals in seg_bounds.items()}
+
+
+def _add_branch_position_columns(cov_df, seg_bounds):
+    """Add branch-aware labels and outward-from-junction branch coordinates."""
+    cov_df = cov_df.copy()
+    segment_ids = cov_df["track_segment_id"].astype("Int64")
+    seg_min = segment_ids.map({seg: bounds["min"] for seg, bounds in seg_bounds.items()}).astype(float)
+    seg_max = segment_ids.map({seg: bounds["max"] for seg, bounds in seg_bounds.items()}).astype(float)
+
+    # ``linear_position`` is interpolated independently of ``track_segment_id``.
+    # Around graph transitions this can produce impossible row combinations
+    # (e.g. a segment label from one arm with a position from another).  For the
+    # branch-aware basis, enforce segment-consistent support before computing the
+    # outward-from-junction coordinate.
+    linear_pos_clipped = cov_df["linear_position"].clip(lower=seg_min, upper=seg_max)
+
+    branch_id = pd.Series(pd.NA, index=cov_df.index, dtype="object")
+    branch_pos_cm = pd.Series(np.nan, index=cov_df.index, dtype=float)
+
+    for branch_name, spec in BRANCH_SPECS.items():
+        branch_mask = segment_ids.isin(spec["segments"])
+        if not branch_mask.any():
+            continue
+
+        origin_bounds = seg_bounds[spec["origin_segment"]]
+        if spec["direction"] > 0:
+            origin_pos = origin_bounds["min"]
+            branch_pos_cm.loc[branch_mask] = (
+                linear_pos_clipped.loc[branch_mask] - origin_pos
+            )
+        else:
+            origin_pos = origin_bounds["max"]
+            branch_pos_cm.loc[branch_mask] = (
+                origin_pos - linear_pos_clipped.loc[branch_mask]
+            )
+        branch_id.loc[branch_mask] = branch_name
+
+    if branch_id.isna().any():
+        missing_segments = sorted(segment_ids[branch_id.isna()].dropna().unique().tolist())
+        raise ValueError(
+            f"Could not assign branch_id for track_segment_id values: {missing_segments}"
+        )
+
+    cov_df["branch_id"] = pd.Categorical(
+        branch_id, categories=list(BRANCH_SPECS.keys()), ordered=True
+    )
+    cov_df["branch_pos_cm"] = branch_pos_cm
+    cov_df["linear_position_branchsafe"] = linear_pos_clipped
+
+    branch_max = cov_df.groupby("branch_id", observed=True)["branch_pos_cm"].transform("max")
+    cov_df["branch_pos_scaled"] = np.where(branch_max > 0, branch_pos_cm / branch_max, 0.0)
+    return cov_df
+
+
 def load_and_prepare_data(cfg=None):
     """Load position + spikes, bin, filter, scale.
 
@@ -147,9 +277,8 @@ def load_and_prepare_data(cfg=None):
     base_dir = cfg["base_dir"]
     bin_size = cfg["bin_size"]
 
-    trialized_position = pd.read_csv(
-        f"{base_dir}/analysis/position/trialized_position.csv", index_col="time"
-    )
+    trialized_position = pd.read_csv(cfg["trialized_position"], index_col="time")
+    seg_bounds = _segment_position_bounds(trialized_position)
     data = np.load(f"{base_dir}/analysis/final_spikes/mfpc_spikes.npz",
                    allow_pickle=True)
     mpfc_spikes = [data[f"arr_{i}"] for i in range(len(data.files))]
@@ -186,6 +315,15 @@ def load_and_prepare_data(cfg=None):
     interp_pos = pd.DataFrame(interpolated, columns=cols_to_interp)
     interp_pos.insert(0, "time_bin_center", bin_centers)
 
+    # NaN out bins that fall outside any epoch's time range
+    epoch_ranges = trialized_position.groupby("epoch").apply(
+        lambda g: (g.index.min(), g.index.max()))
+    in_epoch = np.zeros(len(bin_centers), dtype=bool)
+    for t_start, t_end in epoch_ranges.values:
+        in_epoch |= (bin_centers >= t_start) & (bin_centers <= t_end)
+    if not in_epoch.all():
+        interp_pos.loc[~in_epoch] = np.nan
+
     # base mask: run zone, outbound + inbound
     base_mask = (
         (interp_pos["zone"] == "run")
@@ -204,6 +342,7 @@ def load_and_prepare_data(cfg=None):
     )
     cov_df_common = cov_df[common_mask].copy()
     spike_counts_common = spike_counts_masked[:, common_mask]
+    cov_df_common = _add_branch_position_columns(cov_df_common, seg_bounds)
 
     speed_min_val = cov_df_common["speed"].min()
     speed_max_val = cov_df_common["speed"].max()
@@ -227,6 +366,7 @@ def load_and_prepare_data(cfg=None):
     cov_df_out_common["pos_scaled"] = (
         (cov_df_out_common["linear_position"] - pos_min_val) / (pos_max_val - pos_min_val)
     )
+    cov_df_out_common = _add_branch_position_columns(cov_df_out_common, seg_bounds)
 
     # correct trials: outbound + inbound, no zone or speed filter
     correct_mask = interp_pos["trial_type"].isin(["outbound", "inbound"])
@@ -307,7 +447,7 @@ def load_model_outputs(model_name, base_dir=None, cfg=None, fit_history=False):
     )
 
 
-# 2. GLM fitting 
+# 2. GLM fitting
 
 def fit_glm_all_units(formula: str,
                       cov_df: pd.DataFrame,
@@ -434,7 +574,7 @@ def fit_glm_all_units(formula: str,
         if per_unit_transform is not None:
             df = per_unit_transform(df, spike_counts_masked[i], i)
         try:
-            res = smf.glm(formula, data=df, family=sm.families.Poisson()).fit(disp=False)
+            res = _fit_glm_with_fallback(formula, df, family=sm.families.Poisson())
             rows.append(dict(
                 unit=uid,
                 aic=res.aic,
@@ -442,7 +582,7 @@ def fit_glm_all_units(formula: str,
                 deviance=res.deviance,
                 n_params=len(res.params),
                 n_obs=int(res.nobs),
-                converged=res.converged,
+                converged=_result_converged(res),
                 coef=res.params.to_dict(),
                 bse=res.bse.to_dict(),
                 deviance_null = res.null_deviance,
@@ -581,11 +721,11 @@ def fit_single_unit(formula, cov_df, spike_counts, unit_idx,
     df["spike_count"] = spike_counts[unit_idx]
     if per_unit_transform is not None:
         df = per_unit_transform(df, spike_counts[unit_idx], unit_idx)
-    return smf.glm(formula, data=df, family=family).fit(disp=False)
+    return _fit_glm_with_fallback(formula, df, family=family)
 
 
 def add_spike_history(df, spike_counts_unit, unit_idx,
-                      windows_ms=((0, 2), (2, 10), (10, 50), (50, 200)),
+                      windows_ms=((0, 2), (2, 10), (10, 20), (20, 50)),
                       bin_size=0.002):
     """Add windowed spike-history covariates for one unit.
 
@@ -689,19 +829,53 @@ def _parse_formula_terms(formula):
     return [t for t in terms if t]
 
 
-def _infer_term_df(term):
+def _infer_term_df(term, levels = None):
     """Extract degrees of freedom from a spline term string.
 
     Returns the df value for spline terms (bs/cr), or 1 for plain
     categorical/continuous terms.
+    
+    term: str, the term to scan
+    levels: dict, maps column name to number of unique levels in data, e.g. {"branch_id": 3, "trial_type": 2, "choice": 2}
     """
-    m = re.search(r'df\s*=\s*(\d+)', term)
-    return int(m.group(1)) if m else 1
+    levels = levels or {}
+    has_interaction = ":" in term
+    has_categorical = "C(" in term
+    has_spline_df = "df" in term
+    
+    if has_interaction and has_categorical and has_spline_df:
+        m = re.search(r'C\((\w+)\)', term)
+        varname = m.group(1)
+        
+        m = re.search(r'df\s*=\s*(\d+)', term)
+        spline_df = int(m.group(1))
+        
+        return spline_df*(levels.get(varname, 2) -1) # number of levels in varname - 1
+    
+    elif has_categorical and not has_spline_df:
+        m = re.search(r'C\((\w+)\)', term)
+        varname = m.group(1)
+        return (levels.get(varname, 2) -1)
+    
+    elif has_spline_df:
+        m = re.search(r'df\s*=\s*(\d+)', term)
+        if m:
+            return int(m.group(1))
+        else:
+            raise ValueError(f"term '{term}' contains 'df' but no 'df=N' pattern found")
+
+    else:
+        warnings.warn(f"term '{term}' defaulted to df=1")
+        return 1
 
 
 def make_drop_one_specs(datasets, model_names, base_dir=None,
                         registry=None, cfg=None,
-                        fit_history=False, history_windows_ms=None):
+                        fit_history=False, history_windows_ms=None,
+                        term_groups = None,
+                        levels = {"branch_id": 3,
+                                  "trial_type": 2,
+                                  "choice": 2}):
     """Build drop-one specs from the model registry.
 
     Parameters
@@ -713,7 +887,12 @@ def make_drop_one_specs(datasets, model_names, base_dir=None,
     base_dir : str, optional
     registry : dict, optional — from ``build_model_registry()``.
     cfg : dict, optional — falls back to ``CONFIG``.
+    fit_history: bool, whether history terms were fit
+    history_windows_ms: list of (start_ms, end_ms), history windows in ms
+    term_groups: list of lists    , group terms to be dropped together
     """
+    print(f"Using variable levels {levels}: make sure this is correct")
+    
     cfg = cfg or CONFIG
     base_dir = base_dir or cfg["base_dir"]
     if registry is None:
@@ -735,14 +914,22 @@ def make_drop_one_specs(datasets, model_names, base_dir=None,
             formula = make_history_formula(formula, windows_ms=history_windows_ms)
         ds_key  = entry["dataset"]
         terms   = _parse_formula_terms(formula)
+        
+        for group in (term_groups or []):
+            if not set(group).issubset(terms):
+                raise ValueError(f"term_group {group} not found in terms for model '{name}'")
 
+            grouped_terms = " + ".join(group)
+            terms = [term for term in terms if term not in group]
+            terms.append(grouped_terms)
+                
         cov_df, spike_counts = datasets[ds_key]
         model_stem = os.path.splitext(os.path.basename(model_csv_path(run_name, base_dir=base_dir, cfg=cfg)))[0]
         null_run_name = _run_name("null" if ds_key == "common" else "null_outbound")
         specs[model_stem] = {
             "formula_lhs": formula.split("~")[0].strip(),
             "terms": terms,
-            "delta_df": {t: _infer_term_df(t) for t in terms},
+            "delta_df": {t: _infer_term_df(t, levels = levels) for t in terms},
             "cov_df": cov_df,
             "spike_counts": spike_counts,
             "null_csv": model_csv_path(null_run_name, base_dir=base_dir, cfg=cfg),
@@ -790,7 +977,12 @@ def compute_drop_one_lrt(model_name, base_dir, drop_one_specs):
             lrt_stat     = 2 * (llf_full - llf_reduced)
             lrt_pval     = 1 - chi2.cdf(lrt_stat, lrt_df) if lrt_df > 0 else np.nan
             deviance_null = full.loc[uid, "deviance_null"]
+            deviance_full = full.loc[uid, "deviance"]
             partial_r2   = lrt_stat / deviance_null if deviance_null > 0 else np.nan
+            if deviance_null - deviance_full <= 0:
+                fdl = np.nan
+            else:
+                fdl = lrt_stat/(deviance_null - deviance_full)
 
             rows.append(dict(
                 unit         = uid,
@@ -801,13 +993,88 @@ def compute_drop_one_lrt(model_name, base_dir, drop_one_specs):
                 lrt_pval     = lrt_pval,
                 significant  = bool(lrt_pval < 0.05) if not np.isnan(lrt_pval) else False,
                 delta_aic    = aic_full - aic_reduced,  # negative = full model better; kept for non-nested comparisons
-                partial_r2   = partial_r2,               # N-invariant: lrt_stat / deviance_null
+                partial_r2   = partial_r2,               # N-invariant: lrt_stat / deviance_null,
+                fraction_of_explained_deviance_lost = fdl                                
             ))
 
         if n_skipped:
             print(f"  [{model_name} drop={term}] skipped {n_skipped} units (non-converged)")
 
     return pd.DataFrame(rows)
+
+def compute_single_var_vs_null(single_var_model_keys, base_dir,
+                               full_model_key="full_model",
+                               null_model_key="null", 
+                               cfg = CONFIG,):
+    
+    base_dir = cfg["base_dir"]
+    null = pd.read_csv(model_csv_path(null_model_key, base_dir = base_dir, cfg = cfg), index_col = 0)
+    full = pd.read_csv(model_csv_path(full_model_key, base_dir = base_dir, cfg = cfg), index_col=0)
+
+    full = full.set_index("unit")
+    null = null.set_index("unit")
+    
+    rows = []
+    registry = build_model_registry(cfg = cfg)
+    
+    
+    for key in single_var_model_keys:
+        single_model = pd.read_csv(model_csv_path(key, base_dir=base_dir, cfg = cfg), index_col=0)
+        single_model = single_model.set_index("unit")
+        formula = registry[key]["formula"]
+        term = formula.split("~", 1)[1].strip()
+        
+        
+        
+        n_skipped = 0
+        
+        for uid in full.index:
+            if not full.loc[uid, "converged"] or not single_model.loc[uid, "converged"] or not null.loc[uid, "converged"]:
+                n_skipped+=1
+                continue
+            
+            llf_single = single_model.loc[uid, "llf"]
+            llf_null = null.loc[uid, "llf"]
+            lrt_stat = 2*(llf_single - llf_null)
+            lrt_df = single_model.loc[uid, "n_params"] - 1 # n_params_single - n_params_null
+            
+            lrt_pval = 1- chi2.cdf(lrt_stat, lrt_df)
+            
+            deviance_single = single_model.loc[uid, "deviance"]
+            deviance_null = null.loc[uid, "deviance_null"]
+            deviance_full = full.loc[uid, "deviance"]
+            
+            if (deviance_null - deviance_full) <= 0:
+                fdc = np.nan
+            else:
+                fdc = (deviance_null - deviance_single)/(deviance_null-deviance_full) #fraction of explained deviance captured
+            
+            rows.append(dict(
+                unit = uid,
+                model = key,
+                term = term,
+                lrt_stat = lrt_stat,
+                lrt_df = lrt_df,
+                lrt_pval = lrt_pval,
+                significant = bool(lrt_pval<0.05) if not np.isnan(lrt_pval) else False,
+                fraction_of_explained_deviance_captured = fdc))
+        
+        if n_skipped:
+            print(f"{key} skipped {n_skipped} units (not converged)")
+             
+    return pd.DataFrame(rows)       
+        
+        
+def compute_term_redundancy(drop_one_results, add_one_results):
+    #expects drop_one_results fitted to a SINGLE full model
+    merged = pd.merge(drop_one_results, add_one_results, left_on=["unit", "dropped_term"], right_on= ["unit", "term"], how = "inner")
+    merged["redundancy"] = merged["fraction_of_explained_deviance_captured"] - merged["fraction_of_explained_deviance_lost"]
+    merged = merged.drop(columns = ["dropped_term", "lrt_stat_x", "lrt_stat_y", "lrt_pval_x", "lrt_pval_y", "lrt_df_x", "lrt_df_y", "significant_x", "significant_y", "delta_aic", "partial_r2"])
+    return merged
+    
+
+    
+
 
 
 def apply_fdr_correction(drop_one_results,
@@ -868,6 +1135,7 @@ TERM_LABELS = {
     "trial_type": "trial_type",
     "choice":     "choice",
     "bs(pos_scaled, df = 8)":  "position",
+    "C(branch_id) + bs(branch_pos_scaled, df = 6):C(branch_id)": "branch_position",
     "bs(speed_scaled, df = 4)": "speed",
 }
 
@@ -1016,12 +1284,12 @@ def compute_residuals(results, spike_counts=None, cov_df=None):
 
 
 def _load_trialized_position():
-    """Load trialized_position.csv once and cache at module level."""
-    if not hasattr(_load_trialized_position, "_cache"):
-        base = os.environ.get("SPYGLASS_BASE_DIR", ".")
-        path = os.path.join(base, "analysis", "position", "trialized_position.csv")
+    """Load trialized_position CSV once and cache at module level."""
+    path = CONFIG["trialized_position"]
+    if not hasattr(_load_trialized_position, "_cache") or _load_trialized_position._path != path:
         _load_trialized_position._cache = pd.read_csv(path, index_col="time",
                                                        usecols=["time", "epoch"])
+        _load_trialized_position._path = path
     return _load_trialized_position._cache
 
 
@@ -1532,8 +1800,8 @@ def plot_diagnostics_batch(unit_list, formula, cov_df, spike_counts_masked, unit
         df = cov_df.copy()
         df["spike_count"] = spike_counts_masked[i]
         try:
-            res = smf.glm(formula, data=df, family=sm.families.Poisson()).fit(disp=False)
-            if not res.converged:
+            res = _fit_glm_with_fallback(formula, df, family=sm.families.Poisson())
+            if not _result_converged(res):
                 raise RuntimeError("did not converge")
         except Exception as e:
             for ax in axes[row_idx]:
@@ -1738,9 +2006,8 @@ def compute_model_diagnostics(formula, cov_df, spike_counts_masked, unit_ids,
             df = per_unit_transform(df, spike_counts_masked[i], i)
 
         try:
-            res = smf.glm(formula, data=df,
-                          family=sm.families.Poisson()).fit(disp=False)
-            if not res.converged:
+            res = _fit_glm_with_fallback(formula, df, family=sm.families.Poisson())
+            if not _result_converged(res):
                 raise RuntimeError("not converged")
         except Exception:
             row = dict(unit=uid, converged=False,
@@ -1967,90 +2234,208 @@ def compute_residual_profiles(formula, cov_df, spike_counts_masked, unit_ids,
     return profiles
 
 
-def plot_residual_heterogeneity(profiles, panels=None, row_normalise=True):
+def plot_residual_heterogeneity(profiles, variable, row_normalise=True):
     """
-    Population-level residual heterogeneity: one heatmap per covariate.
+    Population-level residual heterogeneity heatmap for a single covariate.
 
     Parameters
     ----------
     profiles      : dict from compute_model_diagnostics.
-    panels        : dict {col: "continuous"|"categorical"}, optional.
-                    Defaults to all panels detected in profiles.
+    variable      : str, covariate name (e.g. "linear_position", "speed",
+                    "trial_type"). Continuous variables use ``{variable}_profiles``
+                    and ``{variable}_centers``; categorical variables use
+                    ``{variable}_cat_profiles`` and ``{variable}_cat_labels``.
     row_normalise : bool (default True). If True, each row is divided by its
-                    max absolute value so all neurons share the same ±1 scale
-                    (useful for comparing structure across neurons). If False,
-                    raw residuals in spikes/bin are shown with a shared colorscale
-                    (useful for comparing magnitude across models).
+                    max absolute value so all neurons share the same ±1 scale.
     """
-    if panels is None:
-        panels = {}
-        for k in profiles:
-            if k.endswith("_cat_profiles"):
-                panels[k.replace("_cat_profiles", "")] = "categorical"
-            elif k.endswith("_profiles"):
-                panels[k.replace("_profiles", "")] = "continuous"
+    # detect variable type
+    if f"{variable}_cat_profiles" in profiles:
+        kind = "categorical"
+    elif f"{variable}_profiles" in profiles:
+        kind = "continuous"
+    else:
+        raise ValueError(f"No profiles found for variable '{variable}'. "
+                         f"Available keys: {list(profiles.keys())}")
 
-    panels = {col: kind for col, kind in panels.items()
-              if (kind == "continuous" and f"{col}_profiles" in profiles)
-              or (kind == "categorical" and f"{col}_cat_profiles" in profiles)}
+    is_position = (kind == "continuous" and variable == "linear_position")
 
-    if not panels:
-        raise ValueError("No matching panels found in profiles dict.")
+    if is_position:
+        fig, (ax, ax_track) = plt.subplots(
+            2, 1, figsize=(10, 9),
+            gridspec_kw={"height_ratios": [6, 1], "hspace": 0.08},
+        )
+    else:
+        fig, ax = plt.subplots(figsize=(8, 8))
 
-    n = len(panels)
-    fig, axes = plt.subplots(1, n, figsize=(5 * n, 8))
-    axes = np.atleast_1d(axes)
+    if kind == "continuous":
+        mat = np.array(profiles[f"{variable}_profiles"])
+        centers = np.array(profiles[f"{variable}_centers"])
 
-    for ax, (col, kind) in zip(axes, panels.items()):
-        if kind == "continuous":
-            mat     = np.array(profiles[f"{col}_profiles"])
-            centers = np.array(profiles[f"{col}_centers"])
-            if row_normalise:
-                row_max = np.nanmax(np.abs(mat), axis=1, keepdims=True)
-                row_max[row_max == 0] = np.nan
-                mat_plot = mat / row_max
-                vmin, vmax = -1, 1
-            else:
-                mat_plot = mat
-                absmax = np.nanmax(np.abs(mat))
-                vmin, vmax = -absmax, absmax
-            sort_order = np.argsort(np.nanargmax(np.abs(mat_plot), axis=1))
+        if row_normalise:
+            row_max = np.nanmax(np.abs(mat), axis=1, keepdims=True)
+            row_max[row_max == 0] = np.nan
+            mat_plot = mat / row_max
+            vmin, vmax = -1, 1
+        else:
+            mat_plot = mat
+            absmax = np.nanmax(np.abs(mat))
+            vmin, vmax = -absmax, absmax
+
+        sort_order = np.argsort(np.nanargmax(np.abs(mat_plot), axis=1))
+
+        if is_position:
+            # remap columns onto the gapped, duplicated-stem axis
+            axis_info = _get_linearized_branch_axis()
+            seg_bounds = axis_info["seg_bounds"]
+
+            # rebuild the section list with segment ids and directions
+            # (mirrors the definition inside _get_linearized_branch_axis)
+            seg_len = {seg: sb["max"] - sb["min"]
+                       for seg, sb in seg_bounds.items()}
+            section_defs = [
+                dict(seg=3, forward=False),
+                dict(seg=1, forward=False),
+                dict(seg=0, forward=True),   # stem_left
+                dict(seg=0, forward=False),  # stem_right
+                dict(seg=2, forward=True),
+                dict(seg=4, forward=True),
+            ]
+
+            # collect columns per track section, with gap separators
+            section_blocks = []
+            gap_positions = axis_info["gap_centers"]
+            gap_idx = 0
+            for i_sec, (sec_def, ts) in enumerate(
+                    zip(section_defs, axis_info["track_sections"])):
+                # insert NaN gap before this section if needed
+                if gap_idx < len(gap_positions):
+                    gc = gap_positions[gap_idx]
+                    if ts["x0"] > gc:
+                        section_blocks.append(("gap", gc))
+                        gap_idx += 1
+
+                seg = sec_def["seg"]
+                raw_min = seg_bounds[seg]["min"]
+                raw_max = seg_bounds[seg]["max"]
+                x0, x1 = ts["x0"], ts["x1"]
+                mask = (centers >= raw_min) & (centers <= raw_max)
+                idx = np.where(mask)[0]
+                if len(idx) == 0:
+                    continue
+                seg_centers = centers[idx]
+                frac = np.where(
+                    raw_max > raw_min,
+                    (seg_centers - raw_min) / (raw_max - raw_min),
+                    0.0,
+                )
+                if sec_def["forward"]:
+                    gx = x0 + frac * (x1 - x0)
+                else:
+                    gx = x1 - frac * (x1 - x0)
+                order = np.argsort(gx)
+                section_blocks.append(("data", gx[order], mat_plot[:, idx[order]]))
+            # trailing gap
+            if gap_idx < len(gap_positions):
+                section_blocks.append(("gap", gap_positions[gap_idx]))
+
+            # build final matrix with NaN columns at gaps
+            n_units = mat_plot.shape[0]
+            gap_width = 10.0
+            all_cols = []
+            all_x = []
+            for block in section_blocks:
+                if block[0] == "gap":
+                    gc = block[1]
+                    all_x.append(gc - gap_width / 2)
+                    all_cols.append(np.full(n_units, np.nan))
+                    all_x.append(gc + gap_width / 2)
+                    all_cols.append(np.full(n_units, np.nan))
+                else:
+                    _, gx, cols = block
+                    for j in range(len(gx)):
+                        all_x.append(gx[j])
+                        all_cols.append(cols[:, j])
+
+            mat_gapped = np.column_stack(all_cols)
+            gapped_x = np.array(all_x)
+
+            # pcolormesh needs cell edges, not centers
+            n_cols = len(gapped_x)
+            x_edges = np.empty(n_cols + 1)
+            x_edges[1:-1] = 0.5 * (gapped_x[:-1] + gapped_x[1:])
+            x_edges[0] = gapped_x[0] - (x_edges[1] - gapped_x[0])
+            x_edges[-1] = gapped_x[-1] + (gapped_x[-1] - x_edges[-2])
+            y_edges = np.arange(n_units + 1)
+
+            im = ax.pcolormesh(
+                x_edges, y_edges,
+                mat_gapped[sort_order],
+                cmap="RdBu_r", vmin=vmin, vmax=vmax,
+                shading="flat",
+            )
+            # gap and branch annotations
+            for x_gap in axis_info.get("gap_centers", []):
+                ax.axvline(x_gap, color="k", lw=1.5, ls="--", zorder=5, alpha=0.8)
+            x_dup = axis_info.get("stem_duplicate_center")
+            if x_dup is not None:
+                ax.axvline(x_dup, color="k", lw=1.75, ls="-", zorder=5, alpha=1)
+
+            label_map = {"top": "upper", "middle": "stem", "bottom": "lower"}
+            n_units = mat.shape[0]
+            for branch_name, label in label_map.items():
+                for span in axis_info.get("branch_spans", {}).get(branch_name, []):
+                    x_center = 0.5 * (span["xmin"] + span["xmax"])
+                    ax.text(
+                        x_center, -0.5, label,
+                        ha="center", va="bottom", fontsize=10,
+                        fontweight="semibold", color="0.25",
+                        clip_on=False,
+                    )
+            ax.xaxis.set_visible(False)
+            sns.despine(ax=ax, bottom=True)
+
+            _draw_repeated_stem_track(ax_track, axis_info)
+            ax_track.set_xlim(ax.get_xlim())
+            ax_track.set_xlabel("Linear position (cm)")
+        else:
             im = ax.imshow(
                 mat_plot[sort_order], aspect="auto", cmap="RdBu_r",
                 vmin=vmin, vmax=vmax,
                 extent=[centers[0], centers[-1], mat.shape[0], 0],
                 interpolation="nearest",
             )
-            ax.set_xlabel(col)
+            ax.set_xlabel(variable)
+            sns.despine(ax=ax)
 
-        elif kind == "categorical":
-            mat    = np.array(profiles[f"{col}_cat_profiles"])
-            labels = list(profiles[f"{col}_cat_labels"])
-            if row_normalise:
-                row_max = np.nanmax(np.abs(mat), axis=1, keepdims=True)
-                row_max[row_max == 0] = np.nan
-                mat_plot = mat / row_max
-                vmin, vmax = -1, 1
-            else:
-                mat_plot = mat
-                absmax = np.nanmax(np.abs(mat))
-                vmin, vmax = -absmax, absmax
-            sort_order = np.argsort(np.nanargmax(np.abs(mat_plot), axis=1))
-            im = ax.imshow(
-                mat_plot[sort_order], aspect="auto", cmap="RdBu_r",
-                vmin=vmin, vmax=vmax,
-                interpolation="nearest",
-            )
-            ax.set_xticks(range(len(labels)))
-            ax.set_xticklabels(labels)
-            ax.set_xlabel(col)
-
-        cbar_label = "Normalised residual (a.u.)" if row_normalise else "Residual (spikes/bin)"
-        title_suffix = "(row-normalised)" if row_normalise else "(raw)"
-        plt.colorbar(im, ax=ax, label=cbar_label, shrink=0.8)
-        ax.set_ylabel("Unit (sorted by peak)")
-        ax.set_title(f"Residual profiles — {col}\n{title_suffix}")
+    elif kind == "categorical":
+        mat = np.array(profiles[f"{variable}_cat_profiles"])
+        labels = list(profiles[f"{variable}_cat_labels"])
+        if row_normalise:
+            row_max = np.nanmax(np.abs(mat), axis=1, keepdims=True)
+            row_max[row_max == 0] = np.nan
+            mat_plot = mat / row_max
+            vmin, vmax = -1, 1
+        else:
+            mat_plot = mat
+            absmax = np.nanmax(np.abs(mat))
+            vmin, vmax = -absmax, absmax
+        sort_order = np.argsort(np.nanargmax(np.abs(mat_plot), axis=1))
+        im = ax.imshow(
+            mat_plot[sort_order], aspect="auto", cmap="RdBu_r",
+            vmin=vmin, vmax=vmax,
+            interpolation="nearest",
+        )
+        ax.set_xticks(range(len(labels)))
+        ax.set_xticklabels(labels)
+        ax.set_xlabel(variable)
         sns.despine(ax=ax)
+
+    cbar_label = "Normalised residual (a.u.)" if row_normalise else "Residual (spikes/bin)"
+    title_suffix = "(row-normalised)" if row_normalise else "(raw)"
+    cbar_axes = [ax, ax_track] if is_position else ax
+    plt.colorbar(im, ax=cbar_axes, label=cbar_label, shrink=0.8)
+    ax.set_ylabel("Unit (sorted by peak)")
+    ax.set_title(f"Residual profiles — {variable}\n{title_suffix}")
 
     plt.tight_layout()
     return fig
@@ -2507,6 +2892,208 @@ def plot_tuning_comparison(results, syn_df, scaled_col, actual_col, cov_df,
         plt.tight_layout()
 
 
+def _get_linearized_branch_axis(cfg=None, points_per_segment=200):
+    """Return plotting metadata for a split-junction, duplicated-stem display."""
+    cfg = cfg or CONFIG
+    position_df = pd.read_csv(cfg["trialized_position"], usecols=["track_segment_id", "linear_position"])
+    position_df = position_df.dropna(subset=["track_segment_id", "linear_position"]).copy()
+    position_df["track_segment_id"] = position_df["track_segment_id"].astype(int)
+
+    seg_bounds = _segment_position_bounds(position_df)
+    seg_len = {seg: seg_bounds[seg]["max"] - seg_bounds[seg]["min"] for seg in seg_bounds}
+    top_max = seg_len[1] + seg_len[3]
+    stem_max = seg_len[0]
+    bottom_max = seg_len[2] + seg_len[4]
+    gap_size = 10.0
+
+    sections = [
+        dict(seg=3, edge_label="3", node_left="3", node_right="2",
+             branch_id="top", display_section="upper",
+             branch_pos_start=top_max, branch_pos_end=seg_len[1]),
+        dict(seg=1, edge_label="1", node_left="2", node_right="1",
+             branch_id="top", display_section="upper",
+             branch_pos_start=seg_len[1], branch_pos_end=0.0),
+        dict(seg=None, gap=True),
+        dict(seg=0, edge_label="0", node_left="1", node_right="0",
+             branch_id="middle", display_section="stem_left",
+             branch_pos_start=0.0, branch_pos_end=stem_max),
+        dict(seg=0, edge_label="0", node_left="0", node_right="1",
+             branch_id="middle", display_section="stem_right",
+             branch_pos_start=stem_max, branch_pos_end=0.0),
+        dict(seg=None, gap=True),
+        dict(seg=2, edge_label="2", node_left="1", node_right="4",
+             branch_id="bottom", display_section="lower",
+             branch_pos_start=0.0, branch_pos_end=seg_len[2]),
+        dict(seg=4, edge_label="4", node_left="4", node_right="5",
+             branch_id="bottom", display_section="lower",
+             branch_pos_start=seg_len[2], branch_pos_end=bottom_max),
+    ]
+
+    current_x = 0.0
+    gap_centers = []
+    branch_spans = {"top": [], "middle": [], "bottom": []}
+    track_sections = []
+    rows = []
+    for section in sections:
+        if section.get("gap"):
+            gap_centers.append(current_x + gap_size / 2.0)
+            rows.append(pd.DataFrame({
+                "track_segment_id": [np.nan],
+                "linear_position": [np.nan],
+                "linear_position_nogap": [np.nan],
+                "branch_id": [pd.NA],
+                "display_section": [pd.NA],
+                "branch_pos_cm": [np.nan],
+                "branch_pos_scaled": [np.nan],
+            }))
+            current_x += gap_size
+            continue
+
+        seg = section["seg"]
+        seg_length = seg_len[seg]
+        x = np.linspace(current_x, current_x + seg_length, points_per_segment)
+        branch_pos = np.linspace(section["branch_pos_start"], section["branch_pos_end"], points_per_segment)
+        branch_max = {"top": top_max, "middle": stem_max, "bottom": bottom_max}[section["branch_id"]]
+        rows.append(pd.DataFrame({
+            "track_segment_id": seg,
+            "linear_position": x,
+            "linear_position_nogap": x,
+            "branch_id": section["branch_id"],
+            "display_section": section["display_section"],
+            "branch_pos_cm": branch_pos,
+            "branch_pos_scaled": np.where(branch_max > 0, branch_pos / branch_max, 0.0),
+        }))
+
+        track_sections.append({
+            "x0": current_x,
+            "x1": current_x + seg_length,
+            "edge_label": section["edge_label"],
+            "node_left": section["node_left"],
+            "node_right": section["node_right"],
+        })
+        current_x += seg_length
+
+    branch_spans["top"].append({"xmin": track_sections[0]["x0"], "xmax": track_sections[1]["x1"]})
+    branch_spans["middle"].append({"xmin": track_sections[2]["x0"], "xmax": track_sections[2]["x1"]})
+    branch_spans["middle"].append({"xmin": track_sections[3]["x0"], "xmax": track_sections[3]["x1"]})
+    branch_spans["bottom"].append({"xmin": track_sections[4]["x0"], "xmax": track_sections[5]["x1"]})
+
+    grid = pd.concat(rows, ignore_index=True)
+    grid["branch_id"] = pd.Categorical(
+        grid["branch_id"], categories=list(BRANCH_SPECS.keys()), ordered=True
+    )
+
+    return {
+        "seg_bounds": seg_bounds,
+        "gap_centers": gap_centers,
+        "stem_duplicate_center": 0.5 * (track_sections[2]["x1"] + track_sections[3]["x0"]),
+        "branch_spans": branch_spans,
+        "track_sections": track_sections,
+        "grid": grid,
+    }
+
+
+def _draw_repeated_stem_track(ax, axis_info):
+    """Draw the duplicated-stem reference track used by the branch plots."""
+    y0 = 0.0
+    node_positions = []
+    for i, section in enumerate(axis_info["track_sections"]):
+        ax.plot([section["x0"], section["x1"]], [y0, y0], color="k", lw=2.0, zorder=1)
+        ax.text(
+            0.5 * (section["x0"] + section["x1"]), y0,
+            section["edge_label"], ha="center", va="center", fontsize=12, color="0.15"
+        )
+        node_positions.append((section["x0"], section["node_left"]))
+        if i == len(axis_info["track_sections"]) - 1:
+            node_positions.append((section["x1"], section["node_right"]))
+        elif axis_info["track_sections"][i + 1]["x0"] != section["x1"]:
+            node_positions.append((section["x1"], section["node_right"]))
+
+    xs = [x for x, _ in node_positions]
+    ax.scatter(xs, [y0] * len(xs), s=320, color="#1f77b4", zorder=3)
+    for x, label in node_positions:
+        ax.text(x, y0, str(label), ha="center", va="center", fontsize=11, color="black", zorder=4)
+
+    ax.set_ylim(-0.35, 0.35)
+    ax.set_yticks([])
+    ax.set_ylabel("")
+    sns.despine(ax=ax, left=True)
+
+
+def plot_linearized_branch_comparison(results, cov_df, n_bins=120, points_per_segment=200,
+                                      bin_size=None, ax=None, title=None,
+                                      emp_bin_cm=None, smooth_sigma_bins=None):
+    """Overlay empirical and branch-model predicted rates on the gapped linearized axis."""
+    if bin_size is None:
+        bin_size = CONFIG["bin_size"]
+
+    standalone = ax is None
+    ax_track = None
+    if standalone:
+        fig, (ax, ax_track) = plt.subplots(
+            2, 1, figsize=(10, 5.2), sharex=True,
+            gridspec_kw={"height_ratios": [4, 1], "hspace": 0.08}
+        )
+
+    pred_grid, axis_info = _make_linearized_branch_curve_frame(
+        results, cov_df, n_bins=n_bins, points_per_segment=points_per_segment,
+        bin_size=bin_size, emp_bin_cm=emp_bin_cm,
+        smooth_sigma_bins=smooth_sigma_bins,
+    )
+
+    for x_gap in axis_info.get("gap_centers", []):
+        ax.axvline(x_gap, color="k", lw=1.5, ls="--", zorder=0, alpha = 0.8)
+    x_dup = axis_info.get("stem_duplicate_center")
+    if x_dup is not None:
+        ax.axvline(x_dup, color="k", lw=1.75, ls="-", zorder=0, alpha=1)
+
+    ax.plot(pred_grid["linear_position"], pred_grid["emp_rate_hz"],
+            color="grey", alpha=0.8, lw=1.3, label="Empirical")
+    ax.plot(pred_grid["linear_position"], pred_grid["pred_rate_hz"],
+            color="steelblue", lw=2.0, label="GLM predicted")
+
+    y_vals = np.concatenate([
+        pred_grid["emp_rate_hz"].to_numpy(dtype=float),
+        pred_grid["pred_rate_hz"].to_numpy(dtype=float),
+    ])
+    finite_y = y_vals[np.isfinite(y_vals)]
+    if finite_y.size:
+        y_max = float(finite_y.max())
+        y_min = float(finite_y.min())
+        y_pad = max(1.0, 0.08 * max(y_max - y_min, 1.0))
+        ax.set_ylim(top=y_max + y_pad)
+        label_y = y_max + 0.6 * y_pad
+    else:
+        _, current_top = ax.get_ylim()
+        label_y = current_top
+
+    ax.set_xlabel("")
+    ax.set_ylabel("Firing rate (Hz)")
+    ax.set_title(title or "Branch-aware position model on linearized track")
+    ax.legend(fontsize=8)
+    ax.xaxis.set_visible(False)
+    sns.despine(ax=ax, bottom=True)
+
+    label_map = {"top": "upper", "middle": "stem", "bottom": "lower"}
+    for branch_name, label in label_map.items():
+        spans = axis_info.get("branch_spans", {}).get(branch_name, [])
+        for span in spans:
+            x_center = 0.5 * (span["xmin"] + span["xmax"])
+            ax.text(
+                x_center, label_y, label,
+                ha="center", va="bottom", fontsize=12, fontweight="semibold", color="0.25",
+                bbox=dict(facecolor="white", edgecolor="none", pad=0.2, alpha=0.9)
+            )
+
+    if ax_track is not None:
+        _draw_repeated_stem_track(ax_track, axis_info)
+        ax_track.set_xlim(ax.get_xlim())
+        ax_track.set_xlabel("Linear position (cm)")
+
+    if standalone:
+        plt.tight_layout()
+
+
 def plot_categorical_comparison(results, cat_col, cov_df, bin_size=0.002, ax=None):
     """Grouped bar chart: GLM predicted vs empirical rate per category."""
     standalone = ax is None
@@ -2589,9 +3176,12 @@ def compute_marginal_effect(results, term_pattern, sweep_values,
     # injected by per_unit_transform (e.g. spike-history covariates) are present.
     design_info = results.model.data.orig_exog.design_info
     n_sweep = len(sweep_values)
-    fit_frame = results.model.data.frame
-    sweep_df = fit_frame.iloc[:n_sweep].copy()
-    sweep_df[sweep_col] = np.asarray(sweep_values)[:len(sweep_df)]
+    fit_frame = results.model.data.frame.reset_index(drop=True)
+    if fit_frame.empty:
+        raise ValueError("Cannot build marginal curve from an empty fitted design frame")
+
+    sweep_df = fit_frame.iloc[np.zeros(n_sweep, dtype=int)].copy().reset_index(drop=True)
+    sweep_df[sweep_col] = np.asarray(sweep_values)
     # Fill non-swept columns with neutral values so patsy can evaluate
     for col in fit_frame.columns:
         if col == sweep_col or col == "spike_count":
@@ -2599,7 +3189,12 @@ def compute_marginal_effect(results, term_pattern, sweep_values,
         if pd.api.types.is_numeric_dtype(fit_frame[col]):
             sweep_df[col] = fit_frame[col].median()
         else:
-            sweep_df[col] = fit_frame[col].mode().iloc[0]
+            mode = fit_frame[col].mode(dropna=True)
+            if len(mode) > 0:
+                sweep_df[col] = mode.iloc[0]
+            else:
+                non_na = fit_frame[col].dropna()
+                sweep_df[col] = non_na.iloc[0] if len(non_na) else np.nan
 
     X_sweep = np.asarray(
         _patsy.build_design_matrices([design_info], sweep_df,
@@ -2608,6 +3203,76 @@ def compute_marginal_effect(results, term_pattern, sweep_values,
     eta_term = X_sweep[:, term_cols] @ params[term_cols]
 
     # Average exp(η_term + η_other) over all observed data points
+    marginal_hz = np.exp(eta_term[:, None] + eta_other[None, :]).mean(axis=1) / bin_size
+    return marginal_hz
+
+
+def compute_marginal_effect_multi(results, term_patterns, sweep_df, bin_size=None):
+    """Compute a marginal rate curve when sweeping multiple related predictors."""
+    import patsy as _patsy
+
+    if bin_size is None:
+        bin_size = CONFIG["bin_size"]
+
+    sweep_df = pd.DataFrame(sweep_df).reset_index(drop=True)
+    if sweep_df.empty:
+        return np.array([])
+
+    if isinstance(term_patterns, str):
+        term_patterns = (term_patterns,)
+
+    X_fit = np.asarray(results.model.exog, dtype=float)
+    col_names = list(results.model.exog_names)
+    params_raw = results.params
+    if isinstance(params_raw, pd.Series):
+        coef_series = params_raw.reindex(col_names).fillna(0.0)
+    else:
+        coef_series = pd.Series(np.asarray(params_raw, dtype=float), index=col_names)
+    params = coef_series.to_numpy(dtype=float)
+
+    term_cols = [
+        i for i, name in enumerate(col_names)
+        if any(pattern in name for pattern in term_patterns)
+    ]
+    if not term_cols:
+        raise ValueError(
+            f"Could not find any design columns matching patterns {tuple(term_patterns)!r}"
+        )
+
+    other_cols = [i for i in range(len(col_names)) if i not in term_cols]
+    if other_cols:
+        eta_other = X_fit[:, other_cols] @ params[other_cols]
+    else:
+        eta_other = np.zeros(X_fit.shape[0], dtype=float)
+
+    design_info = results.model.data.orig_exog.design_info
+    fit_frame = results.model.data.frame.reset_index(drop=True)
+    if fit_frame.empty:
+        raise ValueError("Cannot build marginal curve from an empty fitted design frame")
+
+    template = fit_frame.iloc[np.zeros(len(sweep_df), dtype=int)].copy().reset_index(drop=True)
+    for col in template.columns:
+        if col == "spike_count":
+            continue
+        if col in sweep_df.columns:
+            template[col] = sweep_df[col].values
+            continue
+
+        source = fit_frame[col]
+        if pd.api.types.is_numeric_dtype(source):
+            template[col] = source.median()
+        else:
+            mode = source.mode(dropna=True)
+            if len(mode) > 0:
+                template[col] = mode.iloc[0]
+            else:
+                non_na = source.dropna()
+                template[col] = non_na.iloc[0] if len(non_na) else np.nan
+
+    X_sweep = np.asarray(
+        _patsy.build_design_matrices([design_info], template, return_type="dataframe")[0]
+    )
+    eta_term = X_sweep[:, term_cols] @ params[term_cols]
     marginal_hz = np.exp(eta_term[:, None] + eta_other[None, :]).mean(axis=1) / bin_size
     return marginal_hz
 
@@ -2651,6 +3316,601 @@ def empirical_tuning_curve(cov_df, actual_col, bin_size=None, n_bins=50,
         rate_hz = np.where(occ > 0, spks / (occ * bin_size), np.nan)
     centers = (bins[:-1] + bins[1:]) / 2
     return centers, rate_hz
+
+
+def _path_coordinate(branch_id, branch_pos_cm, stem_max, outer_branch):
+    """Map branch-local coordinates to a continuous path coordinate."""
+    branch_id = np.asarray(branch_id)
+    branch_pos_cm = np.asarray(branch_pos_cm, dtype=float)
+    out = np.full(len(branch_pos_cm), np.nan, dtype=float)
+
+    stem_mask = branch_id == "middle"
+    outer_mask = branch_id == outer_branch
+    out[stem_mask] = stem_max - branch_pos_cm[stem_mask]
+    out[outer_mask] = stem_max + branch_pos_cm[outer_mask]
+    return out
+
+
+def _estimate_empirical_path_curve(cov_valid, stem_max, outer_branch, n_bins, bin_size,
+                                   emp_bin_cm=None, smooth_sigma_bins=None):
+    """Estimate empirical firing rate on one continuous stem+arm path."""
+    path_mask = cov_valid["branch_id"].isin(["middle", outer_branch])
+    path_df = cov_valid.loc[path_mask].copy()
+    if path_df.empty:
+        return np.array([]), np.array([])
+
+    x = _path_coordinate(
+        path_df["branch_id"].to_numpy(),
+        path_df["branch_pos_cm"].to_numpy(dtype=float),
+        stem_max=stem_max,
+        outer_branch=outer_branch,
+    )
+    w = path_df["spike_count"].to_numpy(dtype=float)
+    valid = np.isfinite(x)
+    x = x[valid]
+    w = w[valid]
+    if len(x) == 0:
+        return np.array([]), np.array([])
+
+    x_min = 0.0
+    x_max = max(stem_max, float(np.nanmax(x)))
+    if emp_bin_cm is not None:
+        edges = np.arange(x_min, x_max + emp_bin_cm, emp_bin_cm, dtype=float)
+        if len(edges) < 2 or edges[-1] < x_max:
+            edges = np.append(edges, x_max)
+    else:
+        edges = np.linspace(x_min, x_max, n_bins + 1)
+
+    occ, _ = np.histogram(x, bins=edges)
+    spks, _ = np.histogram(x, bins=edges, weights=w)
+    occ = occ.astype(float)
+    spks = spks.astype(float)
+    if smooth_sigma_bins is not None and smooth_sigma_bins > 0:
+        occ = gaussian_filter1d(occ, smooth_sigma_bins, mode="nearest")
+        spks = gaussian_filter1d(spks, smooth_sigma_bins, mode="nearest")
+
+    with np.errstate(invalid="ignore", divide="ignore"):
+        rate = np.where(occ > 0, spks / (occ * bin_size), np.nan)
+    centers = (edges[:-1] + edges[1:]) / 2
+    return centers, rate
+
+
+def _fill_empirical_pathwise_curve(pred_grid, cov_valid, n_bins, bin_size,
+                                   emp_bin_cm=None, smooth_sigma_bins=None):
+    """Fill empirical rate using one curve on 0->3 and one on 0->5."""
+    if emp_bin_cm is not None and emp_bin_cm <= 0:
+        raise ValueError("emp_bin_cm must be positive")
+    if smooth_sigma_bins is not None and smooth_sigma_bins < 0:
+        raise ValueError("smooth_sigma_bins must be non-negative")
+
+    stem_max = float(pred_grid.loc[pred_grid["branch_id"] == "middle", "branch_pos_cm"].max())
+    top_max = float(pred_grid.loc[pred_grid["branch_id"] == "top", "branch_pos_cm"].max())
+    path_specs = (
+        ("top", ("upper", "stem_left")),
+        ("bottom", ("stem_right", "lower")),
+    )
+
+    for outer_branch, display_sections in path_specs:
+        centers, rate = _estimate_empirical_path_curve(
+            cov_valid,
+            stem_max=stem_max,
+            outer_branch=outer_branch,
+            n_bins=n_bins,
+            bin_size=bin_size,
+            emp_bin_cm=emp_bin_cm,
+            smooth_sigma_bins=smooth_sigma_bins,
+        )
+        valid_rate = np.isfinite(rate)
+        if valid_rate.sum() == 0:
+            continue
+
+        branch_mask = pred_grid["display_section"].isin(display_sections)
+        branch_df = pred_grid.loc[branch_mask, ["branch_id", "branch_pos_cm", "display_section"]].copy()
+        if branch_df.empty:
+            continue
+
+        branch_pos = np.full(len(branch_df), np.nan, dtype=float)
+        if outer_branch == "top":
+            upper_mask = branch_df["display_section"] == "upper"
+            stem_mask = branch_df["display_section"] == "stem_left"
+            branch_pos[upper_mask] = stem_max + branch_df.loc[upper_mask, "branch_pos_cm"].to_numpy(dtype=float)
+            branch_pos[stem_mask] = stem_max - branch_df.loc[stem_mask, "branch_pos_cm"].to_numpy(dtype=float)
+        else:
+            stem_mask = branch_df["display_section"] == "stem_right"
+            lower_mask = branch_df["display_section"] == "lower"
+            branch_pos[stem_mask] = stem_max - branch_df.loc[stem_mask, "branch_pos_cm"].to_numpy(dtype=float)
+            branch_pos[lower_mask] = stem_max + branch_df.loc[lower_mask, "branch_pos_cm"].to_numpy(dtype=float)
+
+        if valid_rate.sum() >= 2:
+            pred_grid.loc[branch_mask, "emp_rate_hz"] = np.interp(
+                branch_pos, centers[valid_rate], rate[valid_rate]
+            )
+        else:
+            pred_grid.loc[branch_mask, "emp_rate_hz"] = rate[valid_rate][0]
+
+
+def _make_linearized_branch_curve_frame(results, cov_df, n_bins=120,
+                                        points_per_segment=200, bin_size=None,
+                                        emp_bin_cm=None, smooth_sigma_bins=None):
+    """Return branch-model predicted and empirical rates on the gapped track axis."""
+    if bin_size is None:
+        bin_size = CONFIG["bin_size"]
+
+    axis_info = _get_linearized_branch_axis(points_per_segment=points_per_segment)
+    pred_grid = axis_info["grid"].copy()
+    pred_valid = pred_grid["linear_position"].notna()
+
+    sweep_df = pred_grid.loc[pred_valid, ["branch_id", "branch_pos_scaled"]].copy()
+    pred_hz = compute_marginal_effect_multi(
+        results,
+        term_patterns=("branch_id", "branch_pos_scaled"),
+        sweep_df=sweep_df,
+        bin_size=bin_size,
+    )
+    pred_grid["pred_rate_hz"] = np.nan
+    pred_grid.loc[pred_valid, "pred_rate_hz"] = np.asarray(pred_hz, dtype=float)
+
+    cov_valid = cov_df.loc[
+        cov_df["branch_id"].notna()
+        & cov_df["branch_pos_cm"].notna()
+        & cov_df["spike_count"].notna(),
+        ["branch_id", "branch_pos_cm", "spike_count"],
+    ].copy()
+
+    pred_grid["emp_rate_hz"] = np.nan
+    if not cov_valid.empty:
+        _fill_empirical_pathwise_curve(
+            pred_grid, cov_valid, n_bins=n_bins, bin_size=bin_size,
+            emp_bin_cm=emp_bin_cm, smooth_sigma_bins=smooth_sigma_bins,
+        )
+
+    return pred_grid, axis_info
+
+
+def _infer_comparison_spec(model_key=None, formula=None, results=None):
+    """Infer the most natural predicted-vs-empirical comparison axis for a model."""
+    if formula is None and results is not None:
+        formula = getattr(results.model, "formula", None)
+
+    text_parts = []
+    if model_key is not None:
+        text_parts.append(str(model_key))
+    if formula is not None:
+        text_parts.append(str(formula))
+    if results is not None:
+        text_parts.extend(str(name) for name in getattr(results.model, "exog_names", []))
+    text = " ".join(text_parts)
+
+    if ("branch_pos_scaled" in text) or ("branch_id" in text):
+        return {
+            "kind": "linearized_branch",
+            "xlabel": "Linear position (cm)",
+        }
+    if "pos_scaled" in text:
+        return {
+            "kind": "continuous",
+            "term_pattern": "pos_scaled",
+            "sweep_col": "pos_scaled",
+            "actual_col": "linear_position",
+            "xlabel": "Position (cm)",
+            "scaled_from_actual": True,
+        }
+    if "trial_progress" in text:
+        return {
+            "kind": "continuous",
+            "term_pattern": "trial_progress",
+            "sweep_col": "trial_progress",
+            "actual_col": "trial_progress",
+            "xlabel": "Trial progress",
+            "scaled_from_actual": False,
+        }
+    if "speed_scaled" in text:
+        return {
+            "kind": "continuous",
+            "term_pattern": "speed_scaled",
+            "sweep_col": "speed_scaled",
+            "actual_col": "speed",
+            "xlabel": "Speed (cm/s)",
+            "scaled_from_actual": True,
+        }
+    if re.search(r"(?<![A-Za-z0-9_])choice(?![A-Za-z0-9_])", text):
+        return {
+            "kind": "categorical",
+            "term_pattern": "choice",
+            "sweep_col": "choice",
+            "actual_col": "choice",
+            "xlabel": "Choice",
+        }
+    if "trial_type" in text:
+        return {
+            "kind": "categorical",
+            "term_pattern": "trial_type",
+            "sweep_col": "trial_type",
+            "actual_col": "trial_type",
+            "xlabel": "Trial type",
+        }
+    return None
+
+
+def _build_unit_fit_frame(cov_df, spike_counts_masked, unit_index,
+                          per_unit_transform=None):
+    """Return the unit-specific design DataFrame used for fitting/plotting."""
+    df = cov_df.copy()
+    df["spike_count"] = spike_counts_masked[unit_index]
+    if per_unit_transform is not None:
+        df = per_unit_transform(df, spike_counts_masked[unit_index], unit_index)
+    return df
+
+
+def _coerce_coef_dict(coef_entry):
+    """Normalize a stored coefficient payload from fit_glm_all_units."""
+    if isinstance(coef_entry, dict):
+        raw = coef_entry
+    elif isinstance(coef_entry, str):
+        raw = ast.literal_eval(coef_entry)
+    elif pd.isna(coef_entry):
+        raw = {}
+    else:
+        raise TypeError(f"Unsupported coefficient payload type: {type(coef_entry)!r}")
+
+    return {str(k): float(v) for k, v in raw.items()}
+
+
+def _build_design_template(formula, cov_df):
+    """Build reusable Patsy design metadata for a fixed covariate table."""
+    import patsy as _patsy
+
+    _, X_fit = _patsy.dmatrices(formula, cov_df, return_type="dataframe")
+    design_info = X_fit.design_info
+    fit_positions = cov_df.index.get_indexer(X_fit.index)
+    X_fit = X_fit.reset_index(drop=True)
+    return {
+        "fit_positions": fit_positions,
+        "design_info": design_info,
+        "X_fit": np.asarray(X_fit, dtype=float),
+        "col_names": list(X_fit.columns),
+    }
+
+
+def _build_prediction_context(formula, cov_df, coef_entry, design_template=None):
+    """Build Patsy design metadata for prediction from stored coefficients."""
+    if design_template is None:
+        design_template = _build_design_template(formula, cov_df)
+
+    cov_df_fit = cov_df.iloc[design_template["fit_positions"]].copy().reset_index(drop=True)
+    coef_series = pd.Series(_coerce_coef_dict(coef_entry), dtype=float)
+    coef_series = coef_series.reindex(design_template["col_names"]).fillna(0.0)
+
+    return {
+        "formula": formula,
+        "cov_df_fit": cov_df_fit,
+        "design_info": design_template["design_info"],
+        "X_fit": design_template["X_fit"],
+        "coef_series": coef_series,
+        "col_names": design_template["col_names"],
+    }
+
+
+def _compute_marginal_from_context(ctx, term_patterns, sweep_df, bin_size=None):
+    """Compute a marginal prediction curve from stored coefficients."""
+    import patsy as _patsy
+
+    if bin_size is None:
+        bin_size = CONFIG["bin_size"]
+
+    if isinstance(term_patterns, str):
+        term_patterns = (term_patterns,)
+
+    sweep_df = pd.DataFrame(sweep_df).reset_index(drop=True)
+    if sweep_df.empty:
+        return np.array([])
+
+    col_names = ctx["col_names"]
+    params = ctx["coef_series"].reindex(col_names).fillna(0.0).to_numpy(dtype=float)
+    term_cols = [
+        i for i, name in enumerate(col_names)
+        if any(pattern in name for pattern in term_patterns)
+    ]
+    if not term_cols:
+        raise ValueError(
+            f"Could not find any design columns matching patterns {tuple(term_patterns)!r}"
+        )
+
+    other_cols = [i for i in range(len(col_names)) if i not in term_cols]
+    if other_cols:
+        eta_other = ctx["X_fit"][:, other_cols] @ params[other_cols]
+    else:
+        eta_other = np.zeros(ctx["X_fit"].shape[0], dtype=float)
+
+    fit_frame = ctx["cov_df_fit"].reset_index(drop=True)
+    template = fit_frame.iloc[np.zeros(len(sweep_df), dtype=int)].copy().reset_index(drop=True)
+    for col in template.columns:
+        if col == "spike_count":
+            continue
+        if col in sweep_df.columns:
+            template[col] = sweep_df[col].values
+            continue
+
+        source = fit_frame[col]
+        if pd.api.types.is_numeric_dtype(source):
+            template[col] = source.median()
+        else:
+            mode = source.mode(dropna=True)
+            if len(mode) > 0:
+                template[col] = mode.iloc[0]
+            else:
+                non_na = source.dropna()
+                template[col] = non_na.iloc[0] if len(non_na) else np.nan
+
+    X_sweep = np.asarray(
+        _patsy.build_design_matrices([ctx["design_info"]], template, return_type="dataframe")[0],
+        dtype=float,
+    )
+    eta_term = X_sweep[:, term_cols] @ params[term_cols]
+    return np.exp(eta_term[:, None] + eta_other[None, :]).mean(axis=1) / bin_size
+
+
+def _make_linearized_branch_curve_frame_from_context(ctx, cov_df, n_bins=120,
+                                                     points_per_segment=200, bin_size=None,
+                                                     emp_bin_cm=None, smooth_sigma_bins=None):
+    """Return branch-model predicted and empirical rates from stored coefficients."""
+    if bin_size is None:
+        bin_size = CONFIG["bin_size"]
+
+    axis_info = _get_linearized_branch_axis(points_per_segment=points_per_segment)
+    pred_grid = axis_info["grid"].copy()
+    pred_valid = pred_grid["linear_position"].notna()
+    sweep_df = pred_grid.loc[pred_valid, ["branch_id", "branch_pos_scaled"]].copy()
+
+    pred_hz = _compute_marginal_from_context(
+        ctx,
+        term_patterns=("branch_id", "branch_pos_scaled"),
+        sweep_df=sweep_df,
+        bin_size=bin_size,
+    )
+    pred_grid["pred_rate_hz"] = np.nan
+    pred_grid.loc[pred_valid, "pred_rate_hz"] = np.asarray(pred_hz, dtype=float)
+
+    cov_valid = cov_df.loc[
+        cov_df["branch_id"].notna()
+        & cov_df["branch_pos_cm"].notna()
+        & cov_df["spike_count"].notna(),
+        ["branch_id", "branch_pos_cm", "spike_count"],
+    ].copy()
+
+    pred_grid["emp_rate_hz"] = np.nan
+    if not cov_valid.empty:
+        _fill_empirical_pathwise_curve(
+            pred_grid, cov_valid, n_bins=n_bins, bin_size=bin_size,
+            emp_bin_cm=emp_bin_cm, smooth_sigma_bins=smooth_sigma_bins,
+        )
+
+    return pred_grid, axis_info
+
+
+def _chunk_unit_list(unit_list, chunk_size):
+    """Yield consecutive unit-list chunks."""
+    if chunk_size is None or chunk_size <= 0:
+        yield list(unit_list)
+        return
+    for start in range(0, len(unit_list), chunk_size):
+        yield list(unit_list[start:start + chunk_size])
+
+
+def _plot_predicted_vs_actual_row(ctx, cov_df, spec, ax, bin_size=None,
+                                  n_bins=120, n_sweep=300,
+                                  points_per_segment=200, show_legend=False):
+    """Draw one unit row for the batch comparison plot."""
+    if bin_size is None:
+        bin_size = CONFIG["bin_size"]
+
+    kind = spec["kind"]
+    if kind == "linearized_branch":
+        curve_df, _ = _make_linearized_branch_curve_frame_from_context(
+            ctx, cov_df, n_bins=n_bins, points_per_segment=points_per_segment,
+            bin_size=bin_size,
+        )
+        ax.plot(
+            curve_df["linear_position"], curve_df["emp_rate_hz"],
+            color="grey", alpha=0.8, lw=1.3, label="Empirical",
+        )
+        ax.plot(
+            curve_df["linear_position"], curve_df["pred_rate_hz"],
+            color="steelblue", lw=2.0, label="GLM predicted",
+        )
+        ax.xaxis.set_visible(False)
+        sns.despine(ax=ax, bottom=True)
+    elif kind == "continuous":
+        actual_col = spec["actual_col"]
+        actual_vals = cov_df[actual_col].dropna().to_numpy()
+        if len(actual_vals) == 0:
+            raise ValueError(f"No valid values available for {actual_col!r}")
+
+        natural = np.linspace(actual_vals.min(), actual_vals.max(), n_sweep)
+        if spec.get("scaled_from_actual", False):
+            denom = actual_vals.max() - actual_vals.min()
+            if denom > 0:
+                sweep_values = (natural - actual_vals.min()) / denom
+            else:
+                sweep_values = np.zeros_like(natural)
+        else:
+            sweep_values = natural
+
+        marginal_hz = _compute_marginal_from_context(
+            ctx,
+            term_patterns=spec["term_pattern"],
+            sweep_df=pd.DataFrame({spec["sweep_col"]: sweep_values}),
+            bin_size=bin_size,
+        )
+        emp_x, emp_hz = empirical_tuning_curve(
+            cov_df, actual_col, bin_size=bin_size, n_bins=n_bins,
+        )
+
+        ax.plot(emp_x, emp_hz, color="grey", alpha=0.8, lw=1.3, label="Empirical")
+        ax.plot(natural, marginal_hz, color="steelblue", lw=2.0, label="GLM predicted")
+        sns.despine(ax=ax)
+    elif kind == "categorical":
+        cats = sorted(cov_df[spec["actual_col"]].dropna().unique())
+        if not cats:
+            raise ValueError(f"No valid categories available for {spec['actual_col']!r}")
+
+        marginal_hz = _compute_marginal_from_context(
+            ctx,
+            term_patterns=spec["term_pattern"],
+            sweep_df=pd.DataFrame({spec["sweep_col"]: cats}),
+            bin_size=bin_size,
+        )
+        _, emp_hz = empirical_tuning_curve(
+            cov_df, spec["actual_col"], bin_size=bin_size, categorical=True,
+        )
+
+        x = np.arange(len(cats))
+        width = 0.35
+        ax.bar(x - width / 2, emp_hz, width, color="grey", alpha=0.8, label="Empirical")
+        ax.bar(x + width / 2, marginal_hz, width, color="steelblue", alpha=0.8,
+               label="GLM predicted")
+        ax.set_xticks(x)
+        ax.set_xticklabels(cats)
+        sns.despine(ax=ax)
+    else:
+        raise ValueError(f"Unsupported comparison kind: {kind!r}")
+
+    ax.set_ylabel("Hz")
+    if show_legend:
+        ax.legend(fontsize=8, loc="upper right")
+
+
+def plot_predicted_vs_actual_by_unit(unit_list, formula, cov_df, spike_counts_masked,
+                                     fit_df, unit_ids=None, per_unit_transform=None,
+                                     model_key=None, bin_size=None, n_bins=120,
+                                     n_sweep=300, points_per_segment=200,
+                                     figsize_per_row=1.6, max_rows_per_fig=15,
+                                     title=None):
+    """Plot predicted vs empirical firing for selected units from stored fits."""
+    if bin_size is None:
+        bin_size = CONFIG["bin_size"]
+    if unit_ids is None:
+        unit_ids = np.arange(len(spike_counts_masked))
+
+    unit_list = list(unit_list)
+    if len(unit_list) == 0:
+        raise ValueError("unit_list must contain at least one unit")
+
+    spec = _infer_comparison_spec(model_key=model_key, formula=formula)
+    if spec is None:
+        raise ValueError(
+            "Could not infer a comparison axis from this model. "
+            "Provide a model with branch position, position, speed, trial progress, "
+            "choice, or trial type terms."
+        )
+
+    fit_table = fit_df.copy()
+    if "unit" in fit_table.columns:
+        fit_table = fit_table.set_index("unit", drop=False)
+    elif fit_table.index.name != "unit":
+        fit_table.index = pd.Index(fit_table.index, name="unit")
+
+    unit_ids_arr = np.asarray(unit_ids)
+    shared_design_template = None
+    if per_unit_transform is None:
+        template_df = cov_df.copy()
+        template_df["spike_count"] = np.zeros(len(template_df), dtype=float)
+        shared_design_template = _build_design_template(formula, template_df)
+
+    figs = []
+    unit_chunks = list(_chunk_unit_list(unit_list, max_rows_per_fig))
+    n_chunks = len(unit_chunks)
+
+    for chunk_idx, unit_chunk in enumerate(unit_chunks, start=1):
+        n_rows = len(unit_chunk)
+
+        if spec["kind"] == "linearized_branch":
+            height_ratios = [4] * n_rows + [1]
+            fig, axes = plt.subplots(
+                n_rows + 1, 1,
+                figsize=(11, max(figsize_per_row * n_rows + 1.0, 3.5)),
+                sharex=True,
+                gridspec_kw={"height_ratios": height_ratios, "hspace": 0.08},
+            )
+            axes = np.atleast_1d(axes)
+            plot_axes = axes[:-1]
+            ax_track = axes[-1]
+        else:
+            fig, axes = plt.subplots(
+                n_rows, 1,
+                figsize=(10, max(figsize_per_row * n_rows, 2.8)),
+                sharex=(spec["kind"] != "categorical"),
+            )
+            plot_axes = np.atleast_1d(axes)
+            ax_track = None
+
+        for row_idx, (uid, ax) in enumerate(zip(unit_chunk, plot_axes)):
+            matches = np.where(unit_ids_arr == uid)[0]
+            if len(matches) == 0:
+                ax.text(
+                    0.5, 0.5, f"unit {uid}\nnot found",
+                    ha="center", va="center", transform=ax.transAxes, fontsize=9,
+                )
+                ax.set_axis_off()
+                continue
+
+            unit_index = int(matches[0])
+            unit_df = _build_unit_fit_frame(
+                cov_df, spike_counts_masked, unit_index,
+                per_unit_transform=per_unit_transform,
+            )
+
+            try:
+                if uid not in fit_table.index:
+                    raise KeyError(f"unit {uid} missing from fit_df")
+
+                fit_row = fit_table.loc[uid]
+                if isinstance(fit_row, pd.DataFrame):
+                    fit_row = fit_row.iloc[0]
+                if ("converged" in fit_row.index) and (not bool(fit_row["converged"])):
+                    raise RuntimeError("stored fit did not converge")
+
+                ctx = _build_prediction_context(
+                    formula, unit_df, fit_row["coef"],
+                    design_template=shared_design_template,
+                )
+                _plot_predicted_vs_actual_row(
+                    ctx, ctx["cov_df_fit"], spec, ax=ax, bin_size=bin_size,
+                    n_bins=n_bins, n_sweep=n_sweep,
+                    points_per_segment=points_per_segment,
+                    show_legend=(row_idx == 0),
+                )
+                ax.set_title(f"unit {uid}", loc="left", fontsize=9)
+            except Exception as e:
+                ax.text(
+                    0.5, 0.5, f"unit {uid}\nfit failed\n{e}",
+                    ha="center", va="center", transform=ax.transAxes, fontsize=8,
+                )
+                continue
+
+            if row_idx < n_rows - 1 and spec["kind"] != "categorical":
+                ax.tick_params(labelbottom=False)
+
+        if ax_track is not None:
+            axis_info = _get_linearized_branch_axis(points_per_segment=points_per_segment)
+            _draw_repeated_stem_track(ax_track, axis_info)
+            ax_track.set_xlim(plot_axes[-1].get_xlim())
+            ax_track.set_xlabel(spec["xlabel"])
+        else:
+            plot_axes[-1].set_xlabel(spec["xlabel"])
+
+        if title:
+            fig_title = title
+            if n_chunks > 1:
+                fig_title = f"{title} ({chunk_idx}/{n_chunks})"
+            fig.suptitle(fig_title, fontsize=12)
+            plt.tight_layout(rect=(0, 0, 1, 0.98))
+        else:
+            plt.tight_layout()
+
+        figs.append(fig)
+
+    return figs[0] if len(figs) == 1 else figs
 
 
 def plot_marginal_tuning(results, term_pattern, sweep_col, actual_col,
@@ -2930,6 +4190,100 @@ def plot_wtrack_comparison(uid, cov_df, n_bins=50, results=None, pos_run=None,
                         c=rate_run, cmap="hot_r", s=3, zorder=3, vmin=0, vmax=vmax)
         plt.colorbar(sc, ax=ax, label="Hz", shrink=0.8)
         ax.set_title(title)
+        ax.set_xlabel("x (cm)")
+        ax.set_ylabel("y (cm)")
+
+    plt.tight_layout()
+
+
+def plot_wtrack_branch_comparison(results, cov_df, pos_run=None, n_bins=80,
+                                   bin_size=None, title=None):
+    """Two-panel W-track heatmap for a branch position model: empirical vs predicted.
+
+    Unlike plot_wtrack_comparison (which uses a 1-D pos_scaled sweep), this
+    function evaluates the fitted branch model at every observed time bin so
+    that the branch_id categorical covariate is handled correctly.  Predictions
+    for the stem are averaged over both traversal directions.
+
+    Parameters
+    ----------
+    results : statsmodels GLMResults
+        Fitted model that includes branch_id and/or branch_pos_scaled terms.
+    cov_df : DataFrame
+        Covariate DataFrame used for fitting (must have branch_id, branch_pos_cm,
+        linear_position, spike_count).
+    pos_run : DataFrame, optional
+        Position DataFrame with projected_x_position, projected_y_position, and
+        linear_position at video frame rate.  Falls back to _plot_state["pos_run"].
+    n_bins : int
+        Number of linear_position bins for binning empirical and predicted rates.
+    bin_size : float, optional
+        Time-bin width in seconds.  Defaults to CONFIG["bin_size"].
+    title : str, optional
+        Prefix for subplot titles.
+    """
+    import spyglass.linearization.v1 as sgpl
+
+    if bin_size is None:
+        bin_size = CONFIG["bin_size"]
+
+    if pos_run is None:
+        pos_run = _plot_state.get("pos_run")
+    if pos_run is None:
+        raise ValueError("pos_run must be provided via pos_run= or set_plot_state()")
+
+    valid = (
+        cov_df["linear_position"].notna()
+        & cov_df["spike_count"].notna()
+    )
+    cov_valid = cov_df.loc[valid].copy()
+
+    pos_vals = cov_valid["linear_position"].to_numpy(dtype=float)
+    spike_vals = cov_valid["spike_count"].to_numpy(dtype=float)
+
+    pos_min = float(pos_vals.min())
+    pos_max = float(pos_vals.max())
+    edges = np.linspace(pos_min, pos_max, n_bins + 1)
+
+    occ,  _ = np.histogram(pos_vals, bins=edges)
+    spks, _ = np.histogram(pos_vals, bins=edges, weights=spike_vals)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        emp_rate_bins = np.where(occ > 0, spks / (occ.astype(float) * bin_size), np.nan)
+    bin_centers = (edges[:-1] + edges[1:]) / 2
+
+    pred_counts = results.predict(cov_valid).to_numpy(dtype=float)
+    pred_hz_vals = pred_counts / bin_size
+    pred_sum, _ = np.histogram(pos_vals, bins=edges, weights=pred_hz_vals)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        pred_rate_bins = np.where(occ > 0, pred_sum / occ.astype(float), np.nan)
+
+    run_pos = pos_run["linear_position"].to_numpy(dtype=float)
+    finite_emp  = np.isfinite(emp_rate_bins)
+    finite_pred = np.isfinite(pred_rate_bins)
+    emp_rate_run  = np.interp(run_pos, bin_centers[finite_emp],  emp_rate_bins[finite_emp],
+                              left=np.nan, right=np.nan)
+    pred_rate_run = np.interp(run_pos, bin_centers[finite_pred], pred_rate_bins[finite_pred],
+                              left=np.nan, right=np.nan)
+
+    vmax = float(np.nanpercentile(emp_rate_run[np.isfinite(emp_rate_run)], 99))
+
+    label = title or ""
+    graph = sgpl.TrackGraph & {"track_graph_name": CONFIG["wtrack_name"]}
+
+    fig, (ax_emp, ax_pred) = plt.subplots(1, 2, figsize=(14, 5))
+    for ax, rate_run, panel_title in [
+        (ax_emp,  emp_rate_run,  f"{label} — empirical".lstrip(" —")),
+        (ax_pred, pred_rate_run, f"{label} — GLM predicted".lstrip(" —")),
+    ]:
+        graph.plot_track_graph(ax=ax, draw_edge_labels=False)
+        for ln in ax.lines:
+            ln.set_color("lightgrey")
+        sc = ax.scatter(
+            pos_run["projected_x_position"], pos_run["projected_y_position"],
+            c=rate_run, cmap="hot_r", s=3, zorder=3, vmin=0, vmax=vmax,
+        )
+        plt.colorbar(sc, ax=ax, label="Hz", shrink=0.8)
+        ax.set_title(panel_title)
         ax.set_xlabel("x (cm)")
         ax.set_ylabel("y (cm)")
 
