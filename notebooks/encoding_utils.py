@@ -17,6 +17,8 @@ Sections:
 import ast
 import os, re, warnings
 from functools import partial
+from joblib import Parallel, delayed
+from tqdm import tqdm
 import numpy as np
 import pandas as pd
 import statsmodels.api as sm
@@ -449,6 +451,114 @@ def load_model_outputs(model_name, base_dir=None, cfg=None, fit_history=False):
 
 # 2. GLM fitting
 
+def _fit_unit_task(i, uid, cov_df, spike_counts_row, formula, per_unit_transform,
+                   deep_diagnostics, d_cov_cols, d_cat_cols,
+                   bin_edges, bin_centers, cat_labels, diagnostics_n_bins):
+    """Fit one unit; returns (fit_row, diag_row, cont_profiles, cat_profiles, valid_id).
+
+    Module-level so joblib can pickle it for subprocess dispatch.
+    Called by fit_glm_all_units when n_jobs != 1.
+    """
+    df = cov_df.copy()
+    df["spike_count"] = spike_counts_row
+    if per_unit_transform is not None:
+        df = per_unit_transform(df, spike_counts_row, i)
+    try:
+        res = _fit_glm_with_fallback(formula, df, family=sm.families.Poisson())
+        fit_row = dict(
+            unit=uid, aic=res.aic, llf=res.llf, deviance=res.deviance,
+            n_params=len(res.params), n_obs=int(res.nobs),
+            converged=_result_converged(res),
+            coef=res.params.to_dict(), bse=res.bse.to_dict(),
+            deviance_null=res.null_deviance, df_model=res.df_model,
+        )
+        if not deep_diagnostics:
+            return fit_row, None, None, None, None
+
+        predicted = np.asarray(res.predict())
+        observed = np.asarray(res.model.endog)
+        raw = observed - predicted
+        n_spikes = int((observed > 0).sum())
+        cumresid = np.cumsum(raw)
+        drift_auc = np.abs(cumresid).mean() / max(n_spikes, 1)
+        z_unsorted = _compute_z_unsorted(predicted, observed)
+        if len(z_unsorted) >= 4:
+            z_sorted = np.sort(z_unsorted)
+            n = len(z_sorted)
+            ecdf = np.arange(1, n + 1) / n
+            ks_D = float(np.max(np.abs(ecdf - z_sorted)))
+            z_autocorr, _ = spearmanr(z_unsorted[:-1], z_unsorted[1:])
+        else:
+            ks_D, z_autocorr = np.nan, np.nan
+
+        diag_row = dict(unit=uid, converged=True, ks_D=ks_D,
+                        ks_z_autocorr=float(z_autocorr), drift_auc=drift_auc)
+        ss_total = float(np.sum(raw ** 2))
+        cov_df_fit = df.drop(columns=["spike_count"]).reset_index(drop=True)
+        if len(cov_df_fit) != len(observed):
+            cov_df_fit = cov_df_fit.iloc[-len(observed):].reset_index(drop=True)
+
+        for col in d_cov_cols:
+            if col not in cov_df_fit.columns:
+                diag_row[f"resid_eta2_{col}"] = np.nan
+                continue
+            valid_mask = ~np.isnan(cov_df_fit[col].values)
+            if valid_mask.sum() > 10 and ss_total > 0:
+                cov_vals = cov_df_fit[col].values[valid_mask]
+                res_vals = raw[valid_mask]
+                bins = np.linspace(cov_vals.min(), cov_vals.max(), 51)
+                bin_idx = np.clip(np.digitize(cov_vals, bins) - 1, 0, 49)
+                ss_between = sum(
+                    (res_vals[bin_idx == b].mean() ** 2) * (bin_idx == b).sum()
+                    for b in range(50) if (bin_idx == b).any()
+                )
+                diag_row[f"resid_eta2_{col}"] = float(ss_between / ss_total)
+            else:
+                diag_row[f"resid_eta2_{col}"] = np.nan
+
+        cont_profiles = {}
+        for col in bin_edges:
+            if col not in cov_df_fit.columns:
+                cont_profiles[col] = None
+                continue
+            valid_mask = ~np.isnan(cov_df_fit[col].values)
+            cov_vals = cov_df_fit[col].values[valid_mask]
+            res_vals = raw[valid_mask]
+            idx = np.clip(np.digitize(cov_vals, bin_edges[col]) - 1, 0, diagnostics_n_bins - 1)
+            cont_profiles[col] = np.array([
+                res_vals[idx == b].mean() if (idx == b).any() else np.nan
+                for b in range(diagnostics_n_bins)
+            ])
+
+        cat_profiles = {}
+        for col in cat_labels:
+            if col not in cov_df_fit.columns:
+                cat_profiles[col] = None
+                continue
+            cat_vals = cov_df_fit[col].values
+            cat_profiles[col] = np.array([
+                raw[cat_vals == c].mean() if (cat_vals == c).any() else np.nan
+                for c in cat_labels[col]
+            ])
+
+        return fit_row, diag_row, cont_profiles, cat_profiles, uid
+
+    except Exception as e:
+        fit_row = dict(
+            unit=uid, aic=np.nan, llf=np.nan, deviance=np.nan,
+            n_params=np.nan, n_obs=np.nan, converged=False,
+            coef=None, bse=None, deviance_null=np.nan,
+            df_model=np.nan, error=str(e),
+        )
+        if not deep_diagnostics:
+            return fit_row, None, None, None, None
+        diag_row = dict(unit=uid, converged=False,
+                        ks_D=np.nan, ks_z_autocorr=np.nan, drift_auc=np.nan)
+        for col in d_cov_cols:
+            diag_row[f"resid_eta2_{col}"] = np.nan
+        return fit_row, diag_row, None, None, None
+
+
 def fit_glm_all_units(formula: str,
                       cov_df: pd.DataFrame,
                       spike_counts_masked: np.array,
@@ -465,11 +575,16 @@ def fit_glm_all_units(formula: str,
                       diagnostics_categorical_cols = None,
                       diagnostics_n_bins = 50,
                       return_diagnostics = False,
-                      refit = False):
+                      refit = False,
+                      n_jobs = 1):
     """Fit a Poisson GLM for each unit and collect summary statistics.
 
     Parameters
     ----------
+    n_jobs : int
+        Number of parallel worker processes for joblib.Parallel.
+        1 (default) runs the original sequential loop unchanged.
+        -1 uses all available CPU cores via _fit_unit_task workers.
     per_unit_transform : callable, optional
         ``fn(df, spike_counts_1d, unit_index) -> df``.  Called after adding
         ``spike_count`` to *df*.  Use this to inject unit-specific covariates
@@ -568,120 +683,152 @@ def fit_glm_all_units(formula: str,
     valid_prof_ids = []
 
     rows = []
-    for i, uid in enumerate(unit_ids):
-        df = cov_df.copy()
-        df["spike_count"] = spike_counts_masked[i]  # pre-masked counts
-        if per_unit_transform is not None:
-            df = per_unit_transform(df, spike_counts_masked[i], i)
-        try:
-            res = _fit_glm_with_fallback(formula, df, family=sm.families.Poisson())
-            rows.append(dict(
-                unit=uid,
-                aic=res.aic,
-                llf=res.llf,
-                deviance=res.deviance,
-                n_params=len(res.params),
-                n_obs=int(res.nobs),
-                converged=_result_converged(res),
-                coef=res.params.to_dict(),
-                bse=res.bse.to_dict(),
-                deviance_null = res.null_deviance,
-                df_model = res.df_model
-            ))
+    desc = resolved_model_name or "fitting"
+    if n_jobs == 1:
+        # Original sequential loop — unchanged behaviour.
+        for i, uid in tqdm(enumerate(unit_ids), total=len(unit_ids), desc=desc, unit="unit"):
+            df = cov_df.copy()
+            df["spike_count"] = spike_counts_masked[i]  # pre-masked counts
+            if per_unit_transform is not None:
+                df = per_unit_transform(df, spike_counts_masked[i], i)
+            try:
+                res = _fit_glm_with_fallback(formula, df, family=sm.families.Poisson())
+                rows.append(dict(
+                    unit=uid,
+                    aic=res.aic,
+                    llf=res.llf,
+                    deviance=res.deviance,
+                    n_params=len(res.params),
+                    n_obs=int(res.nobs),
+                    converged=_result_converged(res),
+                    coef=res.params.to_dict(),
+                    bse=res.bse.to_dict(),
+                    deviance_null = res.null_deviance,
+                    df_model = res.df_model
+                ))
 
-            if deep_diagnostics:
-                predicted = np.asarray(res.predict())
-                observed = np.asarray(res.model.endog)
-                raw = observed - predicted
-                n_spikes = int((observed > 0).sum())
+                if deep_diagnostics:
+                    predicted = np.asarray(res.predict())
+                    observed = np.asarray(res.model.endog)
+                    raw = observed - predicted
+                    n_spikes = int((observed > 0).sum())
 
-                # Cumulative residual drift.
-                cumresid = np.cumsum(raw)
-                drift_auc = np.abs(cumresid).mean() / max(n_spikes, 1)
+                    # Cumulative residual drift.
+                    cumresid = np.cumsum(raw)
+                    drift_auc = np.abs(cumresid).mean() / max(n_spikes, 1)
 
-                # KS D and z autocorrelation.
-                z_unsorted = _compute_z_unsorted(predicted, observed)
-                if len(z_unsorted) >= 4:
-                    z_sorted = np.sort(z_unsorted)
-                    n = len(z_sorted)
-                    ecdf = np.arange(1, n + 1) / n
-                    ks_D = float(np.max(np.abs(ecdf - z_sorted)))
-                    z_autocorr, _ = spearmanr(z_unsorted[:-1], z_unsorted[1:])
-                else:
-                    ks_D, z_autocorr = np.nan, np.nan
+                    # KS D and z autocorrelation.
+                    z_unsorted = _compute_z_unsorted(predicted, observed)
+                    if len(z_unsorted) >= 4:
+                        z_sorted = np.sort(z_unsorted)
+                        n = len(z_sorted)
+                        ecdf = np.arange(1, n + 1) / n
+                        ks_D = float(np.max(np.abs(ecdf - z_sorted)))
+                        z_autocorr, _ = spearmanr(z_unsorted[:-1], z_unsorted[1:])
+                    else:
+                        ks_D, z_autocorr = np.nan, np.nan
 
-                row = dict(
-                    unit=uid, converged=True, ks_D=ks_D,
-                    ks_z_autocorr=float(z_autocorr), drift_auc=drift_auc
-                )
-                ss_total = float(np.sum(raw ** 2))
+                    row = dict(
+                        unit=uid, converged=True, ks_D=ks_D,
+                        ks_z_autocorr=float(z_autocorr), drift_auc=drift_auc
+                    )
+                    ss_total = float(np.sum(raw ** 2))
 
-                # Use aligned covariates corresponding to fitted rows.
-                cov_df_fit = df.drop(columns=["spike_count"]).reset_index(drop=True)
-                if len(cov_df_fit) != len(observed):
-                    cov_df_fit = cov_df_fit.iloc[-len(observed):].reset_index(drop=True)
+                    # Use aligned covariates corresponding to fitted rows.
+                    cov_df_fit = df.drop(columns=["spike_count"]).reset_index(drop=True)
+                    if len(cov_df_fit) != len(observed):
+                        cov_df_fit = cov_df_fit.iloc[-len(observed):].reset_index(drop=True)
 
-                # Residual eta2 per continuous covariate.
-                for col in d_cov_cols:
-                    if col not in cov_df_fit.columns:
-                        row[f"resid_eta2_{col}"] = np.nan
-                        continue
-                    valid_mask = ~np.isnan(cov_df_fit[col].values)
-                    if valid_mask.sum() > 10 and ss_total > 0:
+                    # Residual eta2 per continuous covariate.
+                    for col in d_cov_cols:
+                        if col not in cov_df_fit.columns:
+                            row[f"resid_eta2_{col}"] = np.nan
+                            continue
+                        valid_mask = ~np.isnan(cov_df_fit[col].values)
+                        if valid_mask.sum() > 10 and ss_total > 0:
+                            cov_vals = cov_df_fit[col].values[valid_mask]
+                            res_vals = raw[valid_mask]
+                            bins = np.linspace(cov_vals.min(), cov_vals.max(), 51)
+                            bin_idx = np.clip(np.digitize(cov_vals, bins) - 1, 0, 49)
+                            ss_between = sum(
+                                (res_vals[bin_idx == b].mean() ** 2) * (bin_idx == b).sum()
+                                for b in range(50) if (bin_idx == b).any()
+                            )
+                            row[f"resid_eta2_{col}"] = float(ss_between / ss_total)
+                        else:
+                            row[f"resid_eta2_{col}"] = np.nan
+
+                    diag_rows.append(row)
+
+                    # Continuous residual profiles.
+                    for col in bin_edges:
+                        if col not in cov_df_fit.columns:
+                            continue
+                        valid_mask = ~np.isnan(cov_df_fit[col].values)
                         cov_vals = cov_df_fit[col].values[valid_mask]
                         res_vals = raw[valid_mask]
-                        bins = np.linspace(cov_vals.min(), cov_vals.max(), 51)
-                        bin_idx = np.clip(np.digitize(cov_vals, bins) - 1, 0, 49)
-                        ss_between = sum(
-                            (res_vals[bin_idx == b].mean() ** 2) * (bin_idx == b).sum()
-                            for b in range(50) if (bin_idx == b).any()
-                        )
-                        row[f"resid_eta2_{col}"] = float(ss_between / ss_total)
-                    else:
+                        idx = np.clip(np.digitize(cov_vals, bin_edges[col]) - 1, 0, diagnostics_n_bins - 1)
+                        means = np.array([
+                            res_vals[idx == b].mean() if (idx == b).any() else np.nan
+                            for b in range(diagnostics_n_bins)
+                        ])
+                        profile_rows[col].append(means)
+
+                    # Categorical residual profiles.
+                    for col in cat_labels:
+                        if col not in cov_df_fit.columns:
+                            continue
+                        cat_vals = cov_df_fit[col].values
+                        means = np.array([
+                            raw[cat_vals == c].mean() if (cat_vals == c).any() else np.nan
+                            for c in cat_labels[col]
+                        ])
+                        cat_profile_rows[col].append(means)
+
+                    valid_prof_ids.append(uid)
+
+            except Exception as e:
+                rows.append(dict(
+                    unit=uid, aic=np.nan, llf=np.nan, deviance=np.nan,
+                    n_params=np.nan, n_obs=np.nan, converged=False,
+                    coef=None, bse=None, deviance_null=np.nan,
+                    df_model=np.nan, error=str(e)
+                ))
+                if deep_diagnostics:
+                    row = dict(unit=uid, converged=False,
+                               ks_D=np.nan, ks_z_autocorr=np.nan, drift_auc=np.nan)
+                    for col in d_cov_cols:
                         row[f"resid_eta2_{col}"] = np.nan
+                    diag_rows.append(row)
 
-                diag_rows.append(row)
-
-                # Continuous residual profiles.
-                for col in bin_edges:
-                    if col not in cov_df_fit.columns:
-                        continue
-                    valid_mask = ~np.isnan(cov_df_fit[col].values)
-                    cov_vals = cov_df_fit[col].values[valid_mask]
-                    res_vals = raw[valid_mask]
-                    idx = np.clip(np.digitize(cov_vals, bin_edges[col]) - 1, 0, diagnostics_n_bins - 1)
-                    means = np.array([
-                        res_vals[idx == b].mean() if (idx == b).any() else np.nan
-                        for b in range(diagnostics_n_bins)
-                    ])
-                    profile_rows[col].append(means)
-
-                # Categorical residual profiles.
-                for col in cat_labels:
-                    if col not in cov_df_fit.columns:
-                        continue
-                    cat_vals = cov_df_fit[col].values
-                    means = np.array([
-                        raw[cat_vals == c].mean() if (cat_vals == c).any() else np.nan
-                        for c in cat_labels[col]
-                    ])
-                    cat_profile_rows[col].append(means)
-
-                valid_prof_ids.append(uid)
-
-        except Exception as e:
-            rows.append(dict(
-                unit=uid, aic=np.nan, llf=np.nan, deviance=np.nan,
-                n_params=np.nan, n_obs=np.nan, converged=False,
-                coef=None, bse=None, deviance_null=np.nan,
-                df_model=np.nan, error=str(e)
-            ))
+    else:
+        # Parallel path: dispatch one worker process per unit via joblib.
+        # _fit_unit_task is module-level so it can be pickled by loky.
+        # return_as='generator_unordered' lets tqdm update as each worker finishes,
+        # then we sort by input order to keep results aligned with unit_ids.
+        raw_gen = Parallel(n_jobs=n_jobs, prefer='processes', return_as='generator_unordered')(
+            delayed(_fit_unit_task)(
+                i, uid, cov_df, spike_counts_masked[i], formula, per_unit_transform,
+                deep_diagnostics, d_cov_cols, d_cat_cols,
+                bin_edges, bin_centers, cat_labels, diagnostics_n_bins,
+            )
+            for i, uid in enumerate(unit_ids)
+        )
+        parallel_results = list(tqdm(raw_gen, total=len(unit_ids), desc=desc, unit="unit"))
+        # restore original order (generator_unordered returns as workers finish)
+        parallel_results.sort(key=lambda t: list(unit_ids).index(t[0]["unit"]))
+        for fit_row, diag_row, cont_profiles, cat_profiles, valid_id in parallel_results:
+            rows.append(fit_row)
             if deep_diagnostics:
-                row = dict(unit=uid, converged=False,
-                           ks_D=np.nan, ks_z_autocorr=np.nan, drift_auc=np.nan)
-                for col in d_cov_cols:
-                    row[f"resid_eta2_{col}"] = np.nan
-                diag_rows.append(row)
+                diag_rows.append(diag_row)
+                if valid_id is not None:
+                    for col in bin_edges:
+                        if cont_profiles and cont_profiles.get(col) is not None:
+                            profile_rows[col].append(cont_profiles[col])
+                    for col in cat_labels:
+                        if cat_profiles and cat_profiles.get(col) is not None:
+                            cat_profile_rows[col].append(cat_profiles[col])
+                    valid_prof_ids.append(valid_id)
 
     result = pd.DataFrame(rows)
     if resolved_model_name is not None:
