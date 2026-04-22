@@ -22,7 +22,7 @@ def _grid_shape(n):
     return nrows, ncols
 
 
-# -- 1. Raster plot ----------------------------------------------------------
+#  1. Raster plot 
 
 def plot_raster(spike_counts, cov_df,
                 epoch=None, units=None, plot_position=False,
@@ -106,7 +106,7 @@ def plot_raster(spike_counts, cov_df,
     return fig, ax_raster
 
 
-# -- 2. ISI distribution grid ------------------------------------------------
+#  2. ISI distribution grid 
 
 def plot_isi_grid(spike_counts, bin_size=0.002, cov_df=None, epoch=None,
                   units=None, max_isi_ms=100, n_hist_bins=100, figsize=None):
@@ -169,7 +169,7 @@ def plot_isi_grid(spike_counts, bin_size=0.002, cov_df=None, epoch=None,
     return fig, axes
 
 
-# -- 3. Autocorrelogram grid -------------------------------------------------
+#  3. Autocorrelogram grid 
 
 def plot_acg_grid(spike_counts, bin_size=0.002, cov_df=None, epoch=None,
                   units=None, max_lag_ms=50, plot_bin_ms=None, figsize=None):
