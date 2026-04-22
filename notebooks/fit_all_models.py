@@ -34,11 +34,18 @@ def parse_args():
         action="store_true",
         help="Augment every selected formula with history terms and use add_spike_history.",
     )
+    parser.add_argument(
+        "--n-jobs",
+        type=int,
+        default=1,
+        help="Parallel worker processes for joblib (default 1 = sequential). Use -1 for all cores.",
+    )
     return parser.parse_args()
 
 
 ARGS = parse_args()
 FIT_HISTORY = bool(ARGS.fit_history)
+N_JOBS = ARGS.n_jobs
 
 
 def _run_name(name):
@@ -89,6 +96,7 @@ def fit_and_save(name, refit=False):
         formula, cov_df, sc, unit_ids,
         model_name=run_name, refit=refit,
         per_unit_transform=HISTORY_TRANSFORM,
+        n_jobs=N_JOBS,
     )
     elapsed = time.time() - t0
     n_converged = result["converged"].sum() if "converged" in result else "?"
