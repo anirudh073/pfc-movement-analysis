@@ -23,7 +23,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__)))
 
 from encoding_utils import (
     CONFIG, build_model_registry, load_and_prepare_data,
-    fit_glm_all_units, compute_model_diagnostics, model_csv_path,
+    fit_glm_all_units, model_csv_path,
+    make_history_formula, make_history_transform,
 )
 
 os.chdir(CONFIG["base_dir"])
@@ -33,7 +34,7 @@ os.chdir(CONFIG["base_dir"])
 CATEGORIES = [
     ("Null / baseline", ["null", "null_outbound"]),
     ("Single-variable", ["trial_type", "choice", "speed_spline", "pos_spline",
-                         "trial_progress_spline"]),
+                         "branch_pos_spline", "trial_progress_spline"]),
     ("Multi-variable",  ["full_model", "temporal_model", "choice_full_model",
                          "choice_temporal_model"]),
 ]
@@ -41,8 +42,12 @@ CATEGORIES = [
 ACTIONS = ["fit", "diagnostics"]
 
 
-def _csv_exists(name):
-    return os.path.exists(model_csv_path(name))
+def _run_name(name, fit_history=False):
+    return f"{name}_history" if fit_history else name
+
+
+def _csv_exists(name, fit_history=False):
+    return os.path.exists(model_csv_path(_run_name(name, fit_history)))
 
 
 # ── curses UI ─────────────────────────────────────────────────────────────────
@@ -78,6 +83,7 @@ def run_selector(stdscr):
     selected_fit  = set()
     selected_diag = set()
     refit = False
+    fit_history = False
     cursor = 0
     action_col = 0  # 0 = fit, 1 = diagnostics
     scroll_offset = 0
@@ -151,7 +157,7 @@ def run_selector(stdscr):
                 entry = registry[key]
                 dataset_tag = "out" if entry["dataset"] == "outbound" else "all"
                 label = f"    {key}"
-                cached = _csv_exists(key)
+                cached = _csv_exists(key, fit_history=fit_history)
 
                 attr = CURSOR if is_cursor else curses.A_NORMAL
                 stdscr.addnstr(row, 0, label.ljust(40), min(40, max_x - 1), attr)
@@ -192,6 +198,16 @@ def run_selector(stdscr):
             refit_attr = RED | curses.A_BOLD if refit else curses.A_DIM
             stdscr.addnstr(refit_row, 0, f"  Force refit (ignore cache): {refit_mark}", max_x - 1, refit_attr)
 
+        fit_hist_row = max_y - 6
+        if fit_hist_row > 0 and fit_hist_row < max_y:
+            hist_mark = "[x]" if fit_history else "[ ]"
+            hist_attr = GREEN if fit_history else curses.A_DIM
+            stdscr.addnstr(
+                fit_hist_row, 0,
+                f"  Fit history terms (all models): {hist_mark}",
+                max_x - 1, hist_attr
+            )
+
         # ── summary ───────────────────────────────────────────────────────
         summary_row = max_y - 4
         if summary_row > 0 and summary_row < max_y:
@@ -204,7 +220,7 @@ def run_selector(stdscr):
         # ── keybinds ──────────────────────────────────────────────────────
         help_row = max_y - 2
         if help_row > 0 and help_row < max_y:
-            hints = "SPACE toggle  TAB column  a select-all  n select-none  c select-category  r refit  ENTER run  q quit"
+            hints = "SPACE toggle  TAB column  a select-all  n select-none  c select-category  h fit_history  r refit  ENTER run  q quit"
             stdscr.addnstr(help_row, 0, hints[:max_x - 1], max_x - 1, CYAN)
 
         stdscr.refresh()
@@ -213,7 +229,7 @@ def run_selector(stdscr):
         key = stdscr.getch()
 
         if key == ord("q") or key == 27:  # q or Esc
-            return None, None, False
+            return None, None, False, False
 
         elif key == curses.KEY_UP or key == ord("k"):
             idx_list = model_indices()
@@ -267,16 +283,20 @@ def run_selector(stdscr):
         elif key == ord("r"):
             refit = not refit
 
+        elif key == ord("h"):
+            fit_history = not fit_history
+
+
         elif key == ord("\n") or key == curses.KEY_ENTER:
             if selected_fit or selected_diag:
-                return selected_fit.copy(), selected_diag.copy(), refit
+                return selected_fit.copy(), selected_diag.copy(), refit, fit_history
 
-    return None, None, False
+    return None, None, False, False
 
 
 # ── execution ─────────────────────────────────────────────────────────────────
 
-def run_selected(selected_fit, selected_diag, refit):
+def run_selected(selected_fit, selected_diag, refit, fit_history=False):
     """Load data and run the selected fits and diagnostics."""
     print("\nLoading data...")
     data = load_and_prepare_data()
@@ -296,63 +316,55 @@ def run_selected(selected_fit, selected_diag, refit):
     print(f"  {len(cov_df_common):,} bins (common), "
           f"{len(cov_df_out_common):,} bins (outbound), "
           f"{len(unit_ids)} units\n")
+    if fit_history:
+        print("  History augmentation: ON")
+    print()
+    history_transform = make_history_transform() if fit_history else None
 
     # preserve registry order
     ordered_keys = list(registry.keys())
 
-    # ── fits ──────────────────────────────────────────────────────────────
-    fit_list = [k for k in ordered_keys if k in selected_fit]
-    if fit_list:
+    # ── single-pass execution (fit once per model) ───────────────────────
+    # selected_fit: params-only
+    # selected_diag: fit + deep diagnostics
+    run_list = [k for k in ordered_keys if (k in selected_fit or k in selected_diag)]
+    if run_list:
+        n_deep = sum(1 for k in run_list if k in selected_diag)
         print(f"{'='*60}")
-        print(f"  Fitting {len(fit_list)} model(s)  "
-              f"{'(force refit)' if refit else '(skip cached)'}")
+        print(f"  Running {len(run_list)} model(s): {len(run_list)-n_deep} params-only, {n_deep} deep diagnostics")
+        print(f"  {'force refit' if refit else 'skip cached'}")
         print(f"{'='*60}")
 
-        for name in fit_list:
-            entry   = registry[name]
+        for idx, name in enumerate(run_list, 1):
+            entry = registry[name]
             cov_df, sc = datasets[entry["dataset"]]
+            run_name = _run_name(name, fit_history=fit_history)
+            formula = make_history_formula(entry["formula"]) if fit_history else entry["formula"]
+            deep = (name in selected_diag)
+            mode_label = "deep diagnostics" if deep else "params-only"
+            csv_stem = os.path.splitext(os.path.basename(model_csv_path(run_name)))[0]
 
-            print(f"\n  [{fit_list.index(name)+1}/{len(fit_list)}] {name} "
-                  f"({len(cov_df):,} bins)...", flush=True)
+            print(
+                f"\n  [{idx}/{len(run_list)}] {run_name} ({mode_label}) "
+                f"({len(cov_df):,} bins)...",
+                flush=True,
+            )
 
             t0 = time.time()
             result = fit_glm_all_units(
-                entry["formula"], cov_df, sc, unit_ids,
-                model_name=name, refit=refit,
+                formula, cov_df, sc, unit_ids,
+                model_name=run_name, refit=refit,
+                per_unit_transform=history_transform,
+                deep_diagnostics=deep,
+                diagnostics_base_dir=base_dir,
+                diagnostics_model_name=csv_stem,
+                diagnostics_covariate_cols=["linear_position", "speed", "trial_progress"],
+                diagnostics_categorical_cols=["trial_type", "choice"],
+                diagnostics_n_bins=50,
             )
             elapsed = time.time() - t0
             n_ok = result["converged"].sum() if "converged" in result.columns else "?"
             print(f"    {n_ok}/{len(unit_ids)} converged ({elapsed:.1f}s)")
-
-    # ── diagnostics ───────────────────────────────────────────────────────
-    diag_list = [k for k in ordered_keys if k in selected_diag]
-    if diag_list:
-        print(f"\n{'='*60}")
-        print(f"  Computing diagnostics for {len(diag_list)} model(s)")
-        print(f"{'='*60}")
-
-        for name in diag_list:
-            entry   = registry[name]
-            cov_df, sc = datasets[entry["dataset"]]
-            csv_stem = os.path.splitext(os.path.basename(model_csv_path(name)))[0]
-
-            print(f"\n  [{diag_list.index(name)+1}/{len(diag_list)}] {name}...",
-                  flush=True)
-
-            t0 = time.time()
-            result, _ = compute_model_diagnostics(
-                formula             = entry["formula"],
-                cov_df              = cov_df,
-                spike_counts_masked = sc,
-                unit_ids            = unit_ids,
-                covariate_cols      = ["linear_position", "speed", "trial_progress"],
-                categorical_cols    = ["trial_type", "choice"],
-                base_dir            = base_dir,
-                model_name          = csv_stem,
-            )
-            elapsed = time.time() - t0
-            n_ok = result["converged"].sum() if "converged" in result.columns else "?"
-            print(f"    Done in {elapsed:.0f}s — {n_ok}/{len(unit_ids)} converged")
 
     print(f"\n{'='*60}")
     print("  All done.")
@@ -362,12 +374,12 @@ def run_selected(selected_fit, selected_diag, refit):
 # ── main ──────────────────────────────────────────────────────────────────────
 
 def main():
-    selected_fit, selected_diag, refit = curses.wrapper(run_selector)
+    selected_fit, selected_diag, refit, fit_history = curses.wrapper(run_selector)
     if selected_fit is None and selected_diag is None:
         print("Cancelled.")
         return
 
-    run_selected(selected_fit, selected_diag, refit)
+    run_selected(selected_fit, selected_diag, refit, fit_history=fit_history)
 
 
 if __name__ == "__main__":
