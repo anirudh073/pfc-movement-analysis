@@ -84,6 +84,7 @@ def run_selector(stdscr):
     selected_diag = set()
     refit = False
     fit_history = False
+    parallel = False  # False = n_jobs 1 (sequential), True = n_jobs -1 (all cores)
     cursor = 0
     action_col = 0  # 0 = fit, 1 = diagnostics
     scroll_offset = 0
@@ -117,7 +118,7 @@ def run_selector(stdscr):
         max_y, max_x = stdscr.getmaxyx()
 
         # ensure cursor is visible
-        visible_rows = max_y - 8  # reserve space for header + footer
+        visible_rows = max_y - 9  # reserve space for header + footer
         if cursor < scroll_offset:
             scroll_offset = cursor
         if cursor >= scroll_offset + visible_rows:
@@ -208,6 +209,16 @@ def run_selector(stdscr):
                 max_x - 1, hist_attr
             )
 
+        parallel_row = max_y - 7
+        if parallel_row > 0 and parallel_row < max_y:
+            par_mark = "[x]" if parallel else "[ ]"
+            par_attr = GREEN if parallel else curses.A_DIM
+            stdscr.addnstr(
+                parallel_row, 0,
+                f"  Parallel fitting (all CPU cores): {par_mark}",
+                max_x - 1, par_attr
+            )
+
         # ── summary ───────────────────────────────────────────────────────
         summary_row = max_y - 4
         if summary_row > 0 and summary_row < max_y:
@@ -220,7 +231,7 @@ def run_selector(stdscr):
         # ── keybinds ──────────────────────────────────────────────────────
         help_row = max_y - 2
         if help_row > 0 and help_row < max_y:
-            hints = "SPACE toggle  TAB column  a select-all  n select-none  c select-category  h fit_history  r refit  ENTER run  q quit"
+            hints = "SPACE toggle  TAB column  a select-all  n select-none  c select-category  h history  p parallel  r refit  ENTER run  q quit"
             stdscr.addnstr(help_row, 0, hints[:max_x - 1], max_x - 1, CYAN)
 
         stdscr.refresh()
@@ -286,17 +297,19 @@ def run_selector(stdscr):
         elif key == ord("h"):
             fit_history = not fit_history
 
+        elif key == ord("p"):
+            parallel = not parallel
 
         elif key == ord("\n") or key == curses.KEY_ENTER:
             if selected_fit or selected_diag:
-                return selected_fit.copy(), selected_diag.copy(), refit, fit_history
+                return selected_fit.copy(), selected_diag.copy(), refit, fit_history, parallel
 
-    return None, None, False, False
+    return None, None, False, False, False
 
 
 # ── execution ─────────────────────────────────────────────────────────────────
 
-def run_selected(selected_fit, selected_diag, refit, fit_history=False):
+def run_selected(selected_fit, selected_diag, refit, fit_history=False, parallel=False):
     """Load data and run the selected fits and diagnostics."""
     print("\nLoading data...")
     data = load_and_prepare_data()
@@ -316,8 +329,11 @@ def run_selected(selected_fit, selected_diag, refit, fit_history=False):
     print(f"  {len(cov_df_common):,} bins (common), "
           f"{len(cov_df_out_common):,} bins (outbound), "
           f"{len(unit_ids)} units\n")
+    n_jobs = -1 if parallel else 1
     if fit_history:
         print("  History augmentation: ON")
+    if parallel:
+        print(f"  Parallel fitting: ON ({os.cpu_count()} logical cores)")
     print()
     history_transform = make_history_transform() if fit_history else None
 
@@ -361,6 +377,7 @@ def run_selected(selected_fit, selected_diag, refit, fit_history=False):
                 diagnostics_covariate_cols=["linear_position", "speed", "trial_progress"],
                 diagnostics_categorical_cols=["trial_type", "choice"],
                 diagnostics_n_bins=50,
+                n_jobs=n_jobs,
             )
             elapsed = time.time() - t0
             n_ok = result["converged"].sum() if "converged" in result.columns else "?"
@@ -374,12 +391,12 @@ def run_selected(selected_fit, selected_diag, refit, fit_history=False):
 # ── main ──────────────────────────────────────────────────────────────────────
 
 def main():
-    selected_fit, selected_diag, refit, fit_history = curses.wrapper(run_selector)
+    selected_fit, selected_diag, refit, fit_history, parallel = curses.wrapper(run_selector)
     if selected_fit is None and selected_diag is None:
         print("Cancelled.")
         return
 
-    run_selected(selected_fit, selected_diag, refit, fit_history=fit_history)
+    run_selected(selected_fit, selected_diag, refit, fit_history=fit_history, parallel=parallel)
 
 
 if __name__ == "__main__":
