@@ -1463,7 +1463,7 @@ DEFAULT_PANELS = {
     "choice":          "categorical",
 }
 
-DEFAULT_HISTORY_WINDOWS_MS = ((0, 2), (2, 10), (10, 20), (20, 50))
+DEFAULT_HISTORY_WINDOWS_MS = ((0, 2), (2, 10))
 
 
 def history_term_names(windows_ms=None):
