@@ -990,6 +990,8 @@ def _infer_term_df(term, levels = None):
     levels: dict, maps column name to number of unique levels in data, e.g. {"branch_id": 3, "trial_type": 2, "choice": 2}
     """
     levels = levels or {}
+    if " + " in term:
+        return sum(_infer_term_df(t.strip(), levels=levels) for t in term.split(" + ")) # for compound terms
     has_interaction = ":" in term
     has_categorical = "C(" in term
     has_spline_df = "df" in term
