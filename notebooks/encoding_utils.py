@@ -1162,12 +1162,16 @@ def compute_drop_one_lrt(model_name, base_dir, drop_one_specs):
 
 def compute_single_var_vs_null(single_var_model_keys, base_dir,
                                full_model_key="full_model",
-                               null_model_key="null", 
+                               null_model_key="null",
+                               use_history=False,
                                cfg = CONFIG,):
-    
+
+    def _key(k):
+        return f"{k}_history" if use_history else k
+
     base_dir = cfg["base_dir"]
-    null = pd.read_csv(model_csv_path(null_model_key, base_dir = base_dir, cfg = cfg), index_col = 0)
-    full = pd.read_csv(model_csv_path(full_model_key, base_dir = base_dir, cfg = cfg), index_col=0)
+    null = pd.read_csv(model_csv_path(_key(null_model_key), base_dir = base_dir, cfg = cfg), index_col = 0)
+    full = pd.read_csv(model_csv_path(_key(full_model_key), base_dir = base_dir, cfg = cfg), index_col=0)
 
     full = full.set_index("unit")
     null = null.set_index("unit")
@@ -1177,7 +1181,7 @@ def compute_single_var_vs_null(single_var_model_keys, base_dir,
     
     
     for key in single_var_model_keys:
-        single_model = pd.read_csv(model_csv_path(key, base_dir=base_dir, cfg = cfg), index_col=0)
+        single_model = pd.read_csv(model_csv_path(_key(key), base_dir=base_dir, cfg = cfg), index_col=0)
         single_model = single_model.set_index("unit")
         formula = registry[key]["formula"]
         term = formula.split("~", 1)[1].strip()
