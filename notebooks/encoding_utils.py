@@ -1025,6 +1025,7 @@ def _infer_term_df(term, levels = None):
 def make_drop_one_specs(datasets, model_names, base_dir=None,
                         registry=None, cfg=None,
                         fit_history=False, history_windows_ms=None,
+                        include_history_in_drop_one=False,
                         term_groups = None,
                         levels = {"branch_id": 3,
                                   "trial_type": 2,
@@ -1042,6 +1043,7 @@ def make_drop_one_specs(datasets, model_names, base_dir=None,
     cfg : dict, optional — falls back to ``CONFIG``.
     fit_history: bool, whether history terms were fit
     history_windows_ms: list of (start_ms, end_ms), history windows in ms
+    include_history_in_drop_one: bool, whether to include history terms in drop-one suite (default False)
     term_groups: list of lists    , group terms to be dropped together
     """
     print(f"Using variable levels {levels}: make sure this is correct")
@@ -1067,7 +1069,10 @@ def make_drop_one_specs(datasets, model_names, base_dir=None,
             formula = make_history_formula(formula, windows_ms=history_windows_ms)
         ds_key  = entry["dataset"]
         terms   = _parse_formula_terms(formula)
-        
+        if fit_history and not include_history_in_drop_one:
+            hist_names = set(history_term_names(history_windows_ms))
+            terms = [t for t in terms if t not in hist_names]
+
         for group in (term_groups or []):
             if not set(group).issubset(terms):
                 raise ValueError(f"term_group {group} not found in terms for model '{name}'")
