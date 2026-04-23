@@ -905,7 +905,8 @@ def fit_drop_one(model_name: str,
                  spec: dict,
                  drop_term: str,
                  base_dir: str,
-                 unit_ids: list):
+                 unit_ids: list,
+                 n_jobs: int = -1):
 
     formula = build_reduced_formula(spec, drop_term)
     drop_term_safe = re.sub(r'[^\w]', '_', drop_term).strip('_')
@@ -913,6 +914,7 @@ def fit_drop_one(model_name: str,
     res = fit_glm_all_units(
         formula, spec["cov_df"], spec["spike_counts"], unit_ids,
         per_unit_transform=spec.get("per_unit_transform"),
+        n_jobs=n_jobs,
     )
 
     res["model"] = model_name
@@ -930,7 +932,8 @@ def run_drop_one_suite(drop_one_specs: dict,
                        model_name: str,
                        base_dir: str,
                        unit_ids: list,
-                       check_if_exists: bool = True):
+                       check_if_exists: bool = True,
+                       n_jobs: int = -1):
 
     spec = drop_one_specs[model_name]
     print(f"\nRunning drop-one suite: {model_name}({len(spec['terms'])} fits)")
@@ -946,10 +949,11 @@ def run_drop_one_suite(drop_one_specs: dict,
             continue
 
         result = fit_drop_one(model_name=model_name,
-                     spec = spec,
+                     spec=spec,
                      drop_term=drop_term,
                      base_dir=base_dir,
-                     unit_ids = unit_ids)
+                     unit_ids=unit_ids,
+                     n_jobs=n_jobs)
         result_list.append(result)
 
     return result_list
