@@ -1032,6 +1032,7 @@ def make_drop_one_specs(datasets, model_names, base_dir=None,
         null_run_name = _run_name("null" if ds_key == "common" else "null_outbound")
         specs[model_stem] = {
             "formula_lhs": formula.split("~")[0].strip(),
+            "full_formula": formula,
             "terms": terms,
             "delta_df": {t: _infer_term_df(t, levels = levels) for t in terms},
             "cov_df": cov_df,
