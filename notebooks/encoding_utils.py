@@ -635,7 +635,9 @@ def fit_glm_all_units(formula: str,
                       diagnostics_n_bins = 50,
                       return_diagnostics = False,
                       refit = False,
-                      n_jobs = 1):
+                      n_jobs = -1,
+                      eval_cov_df = None,
+                      eval_spike_counts_masked = None):
     """Fit a Poisson GLM for each unit and collect summary statistics.
 
     Parameters
@@ -870,6 +872,8 @@ def fit_glm_all_units(formula: str,
                 i, uid, cov_df, spike_counts_masked[i], formula, per_unit_transform,
                 deep_diagnostics, d_cov_cols, d_cat_cols,
                 bin_edges, bin_centers, cat_labels, diagnostics_n_bins,
+                eval_cov_df=eval_cov_df,
+                eval_spike_counts_row=eval_spike_counts_masked[i] if eval_spike_counts_masked is not None else None,
             )
             for i, uid in enumerate(unit_ids)
         )
