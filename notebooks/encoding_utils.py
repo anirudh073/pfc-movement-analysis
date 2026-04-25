@@ -28,6 +28,7 @@ from scipy.ndimage import gaussian_filter1d
 import matplotlib.pyplot as plt
 import seaborn as sns
 from statsmodels.stats.multitest import multipletests
+from patsy import build_design_matrices
 import itertools
 from collections import Counter 
 sns.set_context("talk")
@@ -490,7 +491,8 @@ def fit_glm_cv(df: pd.DataFrame,
 
 def _fit_unit_task(i, uid, cov_df, spike_counts_row, formula, per_unit_transform,
                    deep_diagnostics, d_cov_cols, d_cat_cols,
-                   bin_edges, bin_centers, cat_labels, diagnostics_n_bins):
+                   bin_edges, bin_centers, cat_labels, diagnostics_n_bins,
+                   eval_cov_df=None, eval_spike_counts_row=None):
     """Fit one unit; returns (fit_row, diag_row, cont_profiles, cat_profiles, valid_id).
 
     Module-level so joblib can pickle it for subprocess dispatch.
@@ -509,6 +511,25 @@ def _fit_unit_task(i, uid, cov_df, spike_counts_row, formula, per_unit_transform
             coef=res.params.to_dict(), bse=res.bse.to_dict(),
             deviance_null=res.null_deviance, df_model=res.df_model,
         )
+        try:
+            if eval_cov_df is not None:
+                eval_df = eval_cov_df.copy()
+                eval_df["spike_count"] = eval_spike_counts_row
+                if per_unit_transform is not None:
+                    eval_df = per_unit_transform(eval_df, eval_spike_counts_row, i)
+                test_X = build_design_matrices([res.model.data.design_info], eval_df)[0]
+                y_test = np.asarray(eval_df["spike_count"])
+                mu_test = res.predict(exog=np.asarray(test_X))
+                fit_row["llf_eval"] = res.model.family.loglike(y_test, mu_test)
+                fit_row["n_spikes_eval"] = int(y_test.sum())
+            else:
+                fit_row["llf_eval"] = np.nan
+                fit_row["n_spikes_eval"] = np.nan
+        except Exception as e:
+            warnings.warn(str(e))
+            fit_row["llf_eval"] = np.nan
+            fit_row["n_spikes_eval"] = np.nan
+
         if not deep_diagnostics:
             return fit_row, None, None, None, None
 
@@ -585,7 +606,8 @@ def _fit_unit_task(i, uid, cov_df, spike_counts_row, formula, per_unit_transform
             unit=uid, aic=np.nan, llf=np.nan, deviance=np.nan,
             n_params=np.nan, n_obs=np.nan, converged=False,
             coef=None, bse=None, deviance_null=np.nan,
-            df_model=np.nan, error=str(e),
+            df_model=np.nan, error=str(e), llf_eval=np.nan,
+            n_spikes_eval=np.nan,
         )
         if not deep_diagnostics:
             return fit_row, None, None, None, None
