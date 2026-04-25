@@ -1174,6 +1174,71 @@ def compute_single_var_vs_null(single_var_model_keys, base_dir,
     return pd.DataFrame(rows)       
         
         
+def compute_cv_fdl(model_name, drop_one_specs, unit_ids, trial_col="trial_id", n_folds=5,
+                   seed=42, n_jobs=-1):
+    """Compute cross-validated fraction of deviance lost (FDL) per term per unit.
+
+    Fits full, null, and each reduced model on train folds, evaluates held-out
+    log-likelihood on test folds, then pools across folds before computing the ratio.
+    Pooling avoids instability from folds where full ≈ null by chance.
+    """
+    spec = drop_one_specs[model_name]
+    full_formula = spec["full_formula"]
+    null_formula = spec["formula_lhs"] + " ~ 1"
+    cov_df = spec["cov_df"]
+    spike_counts = spec["spike_counts"]
+    per_unit_transform = spec.get("per_unit_transform")
+
+    trial_folds = make_cv_trial_folds(pd.unique(cov_df[trial_col]), n_folds=n_folds, seed=seed)
+
+    full_folds = []
+    null_folds = []
+    reduced_folds = {term: [] for term in spec["terms"]}
+
+    for fold in trial_folds:
+        train_mask = cov_df[trial_col].isin(fold["train"])
+        test_mask = cov_df[trial_col].isin(fold["test"])
+        train_df = cov_df[train_mask].reset_index(drop=True)
+        test_df = cov_df[test_mask].reset_index(drop=True)
+        spike_counts_train = spike_counts[:, train_mask]
+        spike_counts_test = spike_counts[:, test_mask]
+
+        full_results = fit_glm_all_units(
+            formula=full_formula, cov_df=train_df, spike_counts_masked=spike_counts_train,
+            unit_ids=unit_ids, per_unit_transform=per_unit_transform, n_jobs=n_jobs,
+            eval_cov_df=test_df, eval_spike_counts_masked=spike_counts_test)
+        null_results = fit_glm_all_units(
+            formula=null_formula, cov_df=train_df, spike_counts_masked=spike_counts_train,
+            unit_ids=unit_ids, per_unit_transform=per_unit_transform, n_jobs=n_jobs,
+            eval_cov_df=test_df, eval_spike_counts_masked=spike_counts_test)
+
+        full_folds.append(full_results[["unit", "llf_eval"]].copy())
+        null_folds.append(null_results[["unit", "llf_eval"]].copy())
+
+        for term in spec["terms"]:
+            reduced_formula = build_reduced_formula(spec, term)
+            reduced_results = fit_glm_all_units(
+                formula=reduced_formula, cov_df=train_df, spike_counts_masked=spike_counts_train,
+                unit_ids=unit_ids, per_unit_transform=per_unit_transform, n_jobs=n_jobs,
+                eval_cov_df=test_df, eval_spike_counts_masked=spike_counts_test)
+            reduced_folds[term].append(reduced_results[["unit", "llf_eval"]])
+
+    def _sum_llf(fold_list):
+        return pd.concat(fold_list).groupby("unit")["llf_eval"].sum()
+
+    full_sum = _sum_llf(full_folds)
+    null_sum = _sum_llf(null_folds)
+
+    rows = []
+    for term in spec["terms"]:
+        reduced_sum = _sum_llf(reduced_folds[term])
+        fdl_cv = (full_sum - reduced_sum) / (full_sum - null_sum)
+        for uid in unit_ids:
+            rows.append({"unit": uid, "term": term, "fdl_cv": fdl_cv.get(uid, np.nan)})
+
+    return pd.DataFrame(rows)
+
+
 def compute_term_redundancy(drop_one_results, add_one_results):
     #expects drop_one_results fitted to a SINGLE full model
     merged = pd.merge(drop_one_results, add_one_results, left_on=["unit", "dropped_term"], right_on= ["unit", "term"], how = "inner")
