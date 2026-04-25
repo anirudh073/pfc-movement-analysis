@@ -451,6 +451,34 @@ def load_model_outputs(model_name, base_dir=None, cfg=None, fit_history=False):
 
 # 2. GLM fitting
 
+def make_cv_trial_folds(trial_ids,
+                        n_folds=5,
+                        seed=42):
+    """Return a list of train/test trial id splits for k-fold CV.
+
+    Parameters
+    ----------
+    trial_ids : array-like
+    n_folds : int
+    seed : int
+
+    Returns
+    -------
+    list of dicts: [{"train": [...], "test": [...]}]
+    """
+    trial_ids = np.array(trial_ids)
+    rng = np.random.default_rng(seed)
+    trial_ids_shuffled = trial_ids.copy()
+    rng.shuffle(trial_ids_shuffled)
+    split = np.array_split(trial_ids_shuffled, n_folds)
+    results = []
+    for i in range(n_folds):
+        test = split[i].flatten().tolist()
+        train = np.concatenate([chunk for idx, chunk in enumerate(split) if idx != i]).tolist()
+        results.append({"train": train, "test": test})
+    return results
+
+
 def _fit_unit_task(i, uid, cov_df, spike_counts_row, formula, per_unit_transform,
                    deep_diagnostics, d_cov_cols, d_cat_cols,
                    bin_edges, bin_centers, cat_labels, diagnostics_n_bins):
