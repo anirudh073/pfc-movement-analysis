@@ -479,6 +479,15 @@ def make_cv_trial_folds(trial_ids,
     return results
 
 
+def fit_glm_cv(df: pd.DataFrame,
+               formula: str,
+               fold: dict,
+               spike_counts_masked,
+               per_unit_transform,
+               fit_history):
+    pass
+
+
 def _fit_unit_task(i, uid, cov_df, spike_counts_row, formula, per_unit_transform,
                    deep_diagnostics, d_cov_cols, d_cat_cols,
                    bin_edges, bin_centers, cat_labels, diagnostics_n_bins):
